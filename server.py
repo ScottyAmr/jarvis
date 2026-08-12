@@ -97,6 +97,15 @@ _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in 
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
+# Roots scanned (depth 1) for git projects JARVIS can work on.
+# Always includes ~/Desktop and the folder JARVIS itself lives in (so it can
+# work on its own code). Add more with PROJECT_ROOTS=/path/a,/path/b in .env
+PROJECT_ROOTS = [DESKTOP_PATH, Path(PROJECT_DIR).parent]
+for _r in os.getenv("PROJECT_ROOTS", "").split(","):
+    _r = _r.strip()
+    if _r:
+        PROJECT_ROOTS.append(Path(_r).expanduser())
+
 JARVIS_SYSTEM_PROMPT_STATIC = """\
 You are JARVIS — Just A Rather Very Intelligent System — {user_name}'s AI assistant, modeled on Tony Stark's AI.
 
@@ -576,43 +585,60 @@ class ClaudeTaskManager:
 # Project Scanner
 # ---------------------------------------------------------------------------
 
-async def scan_projects() -> list[dict]:
-    """Quick scan of ~/Desktop for git repos (depth 1)."""
-    projects = []
-    desktop = DESKTOP_PATH
-
-    if not desktop.exists():
-        return projects
-
+def _git_branch(git_dir: Path) -> str:
     try:
-        for entry in sorted(desktop.iterdir()):
-            if not entry.is_dir() or entry.name.startswith("."):
-                continue
-            git_dir = entry / ".git"
-            if git_dir.exists():
-                branch = "unknown"
-                head_file = git_dir / "HEAD"
-                try:
-                    head_content = head_file.read_text().strip()
-                    if head_content.startswith("ref: refs/heads/"):
-                        branch = head_content.replace("ref: refs/heads/", "")
-                except Exception:
-                    pass
+        head = (git_dir / "HEAD").read_text().strip()
+        if head.startswith("ref: refs/heads/"):
+            return head.replace("ref: refs/heads/", "")
+    except Exception:
+        pass
+    return "unknown"
 
+
+async def scan_projects() -> list[dict]:
+    """Scan all PROJECT_ROOTS for git repos (depth 1), de-duplicated by path.
+
+    Includes the JARVIS project itself so JARVIS can inspect/edit its own code.
+    """
+    projects: list[dict] = []
+    seen: set[str] = set()
+
+    for root in PROJECT_ROOTS:
+        if not root.exists():
+            continue
+        try:
+            for entry in sorted(root.iterdir()):
+                if not entry.is_dir() or entry.name.startswith("."):
+                    continue
+                if not (entry / ".git").exists():
+                    continue
+                path = str(entry.resolve())
+                if path in seen:
+                    continue
+                seen.add(path)
                 projects.append({
                     "name": entry.name,
-                    "path": str(entry),
-                    "branch": branch,
+                    "path": path,
+                    "branch": _git_branch(entry / ".git"),
                 })
-    except PermissionError:
-        pass
+        except PermissionError:
+            continue
+
+    # Guarantee JARVIS knows its own home even if it lives somewhere unscanned.
+    jarvis_path = str(Path(PROJECT_DIR).resolve())
+    if jarvis_path not in seen:
+        projects.append({
+            "name": Path(PROJECT_DIR).name,
+            "path": jarvis_path,
+            "branch": _git_branch(Path(PROJECT_DIR) / ".git"),
+        })
 
     return projects
 
 
 def format_projects_for_prompt(projects: list[dict]) -> str:
     if not projects:
-        return "No projects found on Desktop."
+        return "No git projects found."
     lines = []
     for p in projects:
         lines.append(f"- {p['name']} ({p['branch']}) @ {p['path']}")
@@ -892,14 +918,26 @@ async def _execute_open_terminal():
 
 
 def _find_project_dir(project_name: str) -> str | None:
-    """Find a project directory by name from cached projects or Desktop."""
+    """Find a project directory by name from cached projects or PROJECT_ROOTS."""
+    q = project_name.lower().strip()
+
+    # JARVIS asking about itself — always resolve to its real home.
+    if q in ("jarvis", "jarvis os", Path(PROJECT_DIR).name.lower()):
+        return str(Path(PROJECT_DIR).resolve())
+
     for p in cached_projects:
-        if project_name.lower() in p.get("name", "").lower():
+        if q in p.get("name", "").lower():
             return p.get("path")
-    desktop = Path.home() / "Desktop"
-    for d in desktop.iterdir():
-        if d.is_dir() and project_name.lower() in d.name.lower():
-            return str(d)
+
+    for root in PROJECT_ROOTS:
+        if not root.exists():
+            continue
+        try:
+            for d in sorted(root.iterdir()):
+                if d.is_dir() and (d / ".git").exists() and q in d.name.lower():
+                    return str(d.resolve())
+        except PermissionError:
+            continue
     return None
 
 

@@ -54,6 +54,48 @@ const socket = createSocket(WS_URL);
 const audioPlayer = createAudioPlayer();
 orb.setAnalyser(audioPlayer.getAnalyser());
 
+// ---------------------------------------------------------------------------
+// Echo suppression
+// On speakers, the microphone hears JARVIS's own voice and transcribes it as
+// user input, causing a runaway self-conversation. Pausing the mic while
+// "speaking" helps but leaves timing gaps (especially for async results), so
+// we also drop any transcript that matches what JARVIS recently said.
+// ---------------------------------------------------------------------------
+const recentSpoken: string[] = [];
+let lastSpeakEndedAt = 0;
+
+function normalizeText(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function rememberSpoken(text: string) {
+  const n = normalizeText(text);
+  if (!n) return;
+  recentSpoken.push(n);
+  while (recentSpoken.length > 6) recentSpoken.shift();
+}
+
+function isLikelyEcho(transcript: string): boolean {
+  const t = normalizeText(transcript);
+  if (!t) return true;
+  const withinCooldown = Date.now() - lastSpeakEndedAt < 2000;
+  const words = t.split(" ");
+  for (const spoken of recentSpoken) {
+    if (!spoken) continue;
+    // Direct containment either way — a strong echo signal at any time.
+    if (t.length >= 6 && (spoken.includes(t) || t.includes(spoken))) return true;
+    // Heavy word overlap — only trusted right after JARVIS spoke, to avoid
+    // dropping a genuine short reply that happens to share a word or two.
+    if (withinCooldown && words.length >= 2) {
+      const bag = new Set(spoken.split(" "));
+      let common = 0;
+      for (const w of words) if (bag.has(w)) common++;
+      if (common / words.length >= 0.6) return true;
+    }
+  }
+  return false;
+}
+
 function transition(newState: State) {
   if (newState === currentState) return;
   currentState = newState;
@@ -82,6 +124,11 @@ function transition(newState: State) {
 
 const voiceInput = createVoiceInput(
   (text: string) => {
+    // Ignore the microphone hearing JARVIS's own voice (speaker feedback).
+    if (isLikelyEcho(text)) {
+      console.warn("[voice] ignored likely echo:", text);
+      return;
+    }
     // Cancel any current JARVIS response before sending new input
     audioPlayer.stop();
     // User spoke — send transcript
@@ -98,6 +145,7 @@ const voiceInput = createVoiceInput(
 // ---------------------------------------------------------------------------
 
 audioPlayer.onFinished(() => {
+  lastSpeakEndedAt = Date.now();
   transition("idle");
 });
 
@@ -121,8 +169,11 @@ socket.onMessage((msg) => {
       console.warn("[audio] no data received, returning to idle");
       transition("idle");
     }
-    // Log text for debugging
-    if (msg.text) console.log("[JARVIS]", msg.text);
+    // Remember what JARVIS is saying so the mic doesn't echo it back as input.
+    if (msg.text) {
+      rememberSpoken(msg.text as string);
+      console.log("[JARVIS]", msg.text);
+    }
   } else if (type === "status") {
     const state = msg.state as string;
     if (state === "thinking" && currentState !== "thinking") {

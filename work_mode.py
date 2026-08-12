@@ -97,9 +97,14 @@ class WorkSession:
             self._status = "done"
 
             if process.returncode != 0:
-                error = stderr.decode().strip()[:200]
-                log.error(f"claude -p error: {error}")
+                # The CLI reports some failures (e.g. "Not logged in") on stdout,
+                # not stderr — fall back to stdout so the error isn't blank.
+                error = (stderr.decode().strip() or response or "unknown error")[:200]
+                log.error(f"claude -p error (exit {process.returncode}): {error}")
                 self._status = "error"
+                if "logged in" in error.lower() or "/login" in error.lower():
+                    return ("Claude Code isn't logged in, sir — run `claude` in a "
+                            "terminal and use /login, then try again.")
                 return f"Hit a problem, sir: {error}"
 
             log.info(f"Claude Code response for {self._project_name} ({len(response)} chars)")

@@ -7,6 +7,9 @@ node_modules/
 .venv/
 venv/
 
+# Local TTS voice models (large, downloaded per-machine)
+voices/
+
 # Python
 __pycache__/
 *.pyc

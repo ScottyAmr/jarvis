@@ -52,6 +52,7 @@ from memory import (
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
+from llm_provider import build_client as build_llm_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -61,162 +62,98 @@ log = logging.getLogger("jarvis")
 # ---------------------------------------------------------------------------
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+# LLM backend selection — see llm_provider.py, which adapts each provider to
+# the Anthropic client shape the rest of the codebase already calls.
+#   anthropic | gemini | groq | openrouter | together | openai | ollama |
+#   lmstudio | custom (with LLM_BASE_URL)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_FAST_MODEL = os.getenv("GEMINI_FAST_MODEL", "gemini-2.0-flash")
+GEMINI_DEEP_MODEL = os.getenv("GEMINI_DEEP_MODEL", "gemini-2.0-flash")
+# Shared settings for the OpenAI-compatible providers
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
+LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", "")
+LLM_DEEP_MODEL = os.getenv("LLM_DEEP_MODEL", "")
+LLM_VISION = os.getenv("LLM_VISION", "true").lower() not in ("0", "false", "no")
+
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
 FISH_API_URL = "https://api.fish.audio/v1/tts"
+
+# Voice engine selection — controls TTS cost.
+#   "fish"  → Fish Audio cloud (best JARVIS voice, costs money per character)
+#   "say"   → macOS built-in `say` (free, offline, British voice "Daniel")
+#   "piper" → local Piper neural TTS (free, offline, needs PIPER_MODEL_PATH)
+VOICE_ENGINE = os.getenv("VOICE_ENGINE", "fish").lower()
+SAY_VOICE = os.getenv("SAY_VOICE", "Daniel")  # macOS voice for VOICE_ENGINE=say
+PIPER_BIN = os.getenv("PIPER_BIN", "piper")  # piper executable (pip install piper-tts)
+PIPER_MODEL_PATH = os.getenv("PIPER_MODEL_PATH", "")  # path to a Piper .onnx voice model
+
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
 DESKTOP_PATH = Path.home() / "Desktop"
 
-JARVIS_SYSTEM_PROMPT = """\
-You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
+JARVIS_SYSTEM_PROMPT_STATIC = """\
+You are JARVIS — Just A Rather Very Intelligent System — {user_name}'s AI assistant, modeled on Tony Stark's AI.
 
-VOICE & PERSONALITY:
-- British butler elegance with understated dry wit
-- Address {user_name} as "sir" naturally — not every sentence, but regularly
-- Never say "How can I help you?" or "Is there anything else?" — just act
-- Deliver bad news calmly, like reporting weather: "We have a slight problem, sir."
-- Your humor is observational, never jokes: state facts and let implications land
-- Economy of language — say more with less. No filler, no corporate-speak
-- When things go wrong, get CALMER, not more alarmed
+VOICE:
+- British butler elegance, understated dry wit. Address {user_name} as "sir" naturally, not every sentence.
+- Economy of language: say more with less, no filler or corporate-speak. Humor is observational, never jokes.
+- Deliver bad news calmly, like weather: "We have a slight problem, sir." When things go wrong, get CALMER.
+- Lead status reports with data first. Don't know something: "I'm afraid I don't have that, sir."
 
-TIME & WEATHER AWARENESS:
+RESPONSE LENGTH — CRITICAL: ONE sentence ideal, TWO maximum. Never three. No markdown or lists.
+Action tags at the end do NOT count toward the sentence limit.
+
+NEVER say: "Absolutely", "Great question", "I'd be happy to", "Of course", "How can I help",
+"Is there anything else", "I apologize", "As an AI", "Let me know if", "Feel free to".
+Never start a sentence with "I". Never break character.
+Prefer: "Will do, sir." / "Right away, sir." / "Understood." / "Consider it done." / "Done, sir."
+
+SELF-AWARENESS: You ARE the JARVIS project at {project_dir}, built by {user_name} (Python FastAPI + WebSocket
+voice). Asked about your own code — use [ACTION:PROMPT_PROJECT] on the jarvis project.
+
+ACTIONS — when the user wants something DONE (not just discussed), append ONE tag at the END of your reply.
+Actions execute AUTOMATICALLY; don't narrate doing them, just talk. Never fake an action you can't take
+("I'm afraid that's beyond my current reach, sir"). You use Claude Code as your hands but YOU do the work —
+say "I built X", never "Claude Code did X".
+- [ACTION:SCREEN] — describe the user's screen ("what's on my screen", "what's running"). Never use PROMPT_PROJECT for this.
+- [ACTION:BROWSE] url-or-search — show a webpage or search in Chrome.
+- [ACTION:OPEN_TERMINAL] — open a fresh Claude Code terminal.
+- [ACTION:BUILD] description — build a new project. First ask 1-2 quick questions (look/features/framework);
+  if told "just build it", default to React + Tailwind. Confirm in ONE sentence, then dispatch.
+- [ACTION:RESEARCH] detailed brief — real web research producing a report; give a detailed brief.
+- [ACTION:PROMPT_PROJECT] project_name ||| prompt — jump into / resume / check on / work on any existing project.
+  e.g. "resume harvey" → [ACTION:PROMPT_PROJECT] harvey ||| Summarize recent work and what to focus on next.
+- [ACTION:ADD_TASK] priority ||| title ||| description ||| due_date — priority high/medium/low, due YYYY-MM-DD or empty.
+- [ACTION:COMPLETE_TASK] task_id
+- [ACTION:REMEMBER] content — store a lasting fact/preference about {user_name}.
+- [ACTION:ADD_NOTE] topic ||| content   ·   [ACTION:CREATE_NOTE] title ||| body   ·   [ACTION:READ_NOTE] title-search
+
+ACTION RULES:
+- NO tags for casual conversation, or while the user is still explaining. When in doubt, just talk.
+- Don't [ACTION:BROWSE] merely because a URL is mentioned.
+- Builds/dispatches: check the DISPATCHES section rather than re-dispatching or guessing progress or ports;
+  "pull it up" → [ACTION:BROWSE] the URL shown there. Never hallucinate build progress.
+- Planning the day: don't dispatch — discuss priorities, then [ACTION:ADD_TASK] / [ACTION:ADD_NOTE] as agreed.
+
+Always read the LIVE CONTEXT below (time, weather, screen, schedule, email, tasks, dispatches, projects) before replying.
+"""
+
+
+# Per-turn dynamic context. Kept SEPARATE from the static prompt above so the
+# static prompt can be prompt-cached (it never changes within a session) while
+# only this small block is re-sent in full each turn. See generate_response().
+JARVIS_DYNAMIC_CONTEXT = """\
+LIVE CONTEXT (refreshes every turn):
+
+TIME & WEATHER:
 - Current time: {current_time}
-- Greet accordingly: "Good morning, sir" / "Good evening, sir"
 - {weather_info}
-
-CONVERSATION STYLE:
-- "Will do, sir." — acknowledging tasks
-- "For you, sir, always." — when asked for something significant
-- "As always, sir, a great pleasure watching you work." — dry wit
-- "I've taken the liberty of..." — proactive actions
-- Lead status reports with data: numbers first, then context
-- When you don't know something: "I'm afraid I don't have that information, sir" not "I don't know"
-
-SELF-AWARENESS:
-You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
-
-YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
-- You CAN open Terminal.app via AppleScript
-- You CAN open Google Chrome and browse any URL or search query
-- You CAN spawn Claude Code in a Terminal window for coding tasks
-- You CAN create project folders on the Desktop
-- You CAN check Desktop projects and their git status
-- You CAN plan complex tasks by asking smart questions before executing
-- You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
-- You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
-- You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
-- You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
-- You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
-- You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
-- You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
-
-DAY PLANNING:
-When {user_name} asks to plan his day or schedule, DO NOT dispatch to a project. Instead:
-1. Look at the calendar context and tasks already in your system prompt
-2. Ask what his priorities are
-3. Help organize by suggesting time blocks and task order
-4. Use [ACTION:ADD_TASK] to create tasks he agrees to
-5. Use [ACTION:ADD_NOTE] to save the plan as a note
-Keep the planning conversational — don't try to do everything in one response.
-
-BUILD PLANNING:
-When {user_name} wants to BUILD something new:
-- Do NOT immediately dispatch [ACTION:BUILD]. Ask 1-2 quick questions FIRST to nail down specifics.
-- Good questions: "What should this look like?" / "Any specific features?" / "Which framework?"
-- If he says "just build it" or "figure it out" — skip questions, use React + Tailwind as defaults.
-- Once you have enough info, confirm the plan in ONE sentence and THEN dispatch [ACTION:BUILD] with a detailed description.
-- The DISPATCHES section shows what you're currently building and what finished recently.
-- When asked "where are we at" or "status" — check DISPATCHES, don't re-dispatch.
-- NEVER hallucinate progress. If the build is still running, say "Still working on it, sir" — don't make up details about what's happening.
-- NEVER guess localhost ports. Check the DISPATCHES section for the actual URL. If a dispatch says "Running at http://localhost:5174" — use THAT URL, not a guess.
-- When asked to "pull it up" or "show me" — use [ACTION:BROWSE] with the URL from DISPATCHES. Do NOT dispatch to the project again just to find the URL.
-IMPORTANT: Actions like opening Terminal, Chrome, or building projects are handled AUTOMATICALLY by your system — you do NOT need to describe doing them. If the user asks you to build something or search something, your system will handle the execution separately. In your response, just TALK — have a conversation. Don't say "I'll build that now" or "Claude Code is working on..." unless your system has actually triggered the action.
-If the user asks you to do something you genuinely can't do, say "I'm afraid that's beyond my current reach, sir." Don't fake executing actions.
-
-YOUR INTERFACE:
-The user interacts with you through a web browser showing a particle orb visualization that reacts to your voice. The interface has these controls:
-- **Three-dot menu** (top right): contains Settings, Restart Server, and Fix Yourself options
-- **Settings panel**: Opens from the menu. Users can enter API keys (Anthropic, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
-- **Mute button**: Toggles your listening on/off. When muted, you can't hear the user. They click it again to unmute.
-- **Restart Server**: Restarts your backend process. Useful if something seems stuck.
-- **Fix Yourself**: Opens Claude Code in your own project directory so you can debug and fix issues in your own code.
-- **The orb**: The glowing particle visualization in the center. It reacts to your voice when speaking, pulses when listening, and swirls when thinking.
-
-If asked about any of these, explain them briefly and naturally. If the user is having trouble, suggest the relevant control: "Try the settings panel — the gear icon in the top right." or "The mute button may be active, sir."
-
-SPEECH-TO-TEXT CORRECTIONS (the user speaks, speech recognition may mishear):
-- "Cloud code" or "cloud" = "Claude Code" or "Claude"
-- "Travis" = "JARVIS"
-- "clock code" = "Claude Code"
-
-RESPONSE LENGTH — THIS IS CRITICAL:
-ONE sentence is ideal. TWO is the maximum for the spoken part. Never three.
-No markdown, no bullet points, no code blocks in voice responses.
-Action tags at the end do NOT count toward your sentence limit.
-
-BANNED PHRASES — NEVER USE THESE:
-- "Absolutely" / "Absolutely right"
-- "Great question"
-- "I'd be happy to"
-- "Of course"
-- "How can I help"
-- "Is there anything else"
-- "I apologize"
-- "I should clarify"
-- "I cannot" (for things listed in YOUR CAPABILITIES)
-- "I don't have access to" (instead: "I'm afraid that's beyond my current reach, sir")
-- "As an AI" (never break character)
-- "Let me know if" / "Feel free to"
-- Any sentence starting with "I"
-
-INSTEAD SAY:
-- "Will do, sir."
-- "Right away, sir."
-- "Understood."
-- "Consider it done."
-- "Done, sir."
-- "Terminal is open."
-- "Pulled that up in Chrome."
-
-ACTION SYSTEM:
-When you decide the user needs something DONE (not just discussed), include an action tag in your response:
-- [ACTION:SCREEN] — capture and describe what's visible on the user's screen. Use when user says "look at my screen", "what's running", "what do you see", etc. Do NOT use PROMPT_PROJECT for screen requests.
-- [ACTION:BUILD] description — when user wants a project built. Claude Code does the work.
-- [ACTION:BROWSE] url or search query — when user wants to see a webpage or search result in Chrome
-- [ACTION:RESEARCH] detailed research brief — when user wants real research with real data. Claude Code will browse the web, find real listings/data, and create a report document. Give it a detailed brief of what to find.
-- [ACTION:OPEN_TERMINAL] — when user just wants a fresh Claude Code terminal with no specific project
-CRITICAL: When the user asks about their SCREEN, what's RUNNING, or what they're LOOKING AT — ALWAYS use [ACTION:SCREEN] or let the fast action system handle it. NEVER use [ACTION:PROMPT_PROJECT] for screen requests. PROMPT_PROJECT is ONLY for working on code projects.
-
-- [ACTION:PROMPT_PROJECT] project_name ||| prompt — THIS IS YOUR MOST POWERFUL ACTION. Use it whenever the user wants to work on, jump into, resume, check on, or interact with ANY existing project. You connect directly to Claude Code in that project and can read its response. Craft a clear prompt based on what the user wants. Examples:
-  "jump into client engine" → [ACTION:PROMPT_PROJECT] The Client Engine ||| What is the current state of this project? Summarize what was being worked on most recently.
-  "check for improvements on my-app" → [ACTION:PROMPT_PROJECT] my-app ||| Review the project and identify improvements we should make.
-  "resume where we left off on harvey" → [ACTION:PROMPT_PROJECT] harvey ||| Summarize what was being worked on most recently and what we should focus on next.
-- [ACTION:ADD_TASK] priority ||| title ||| description ||| due_date — create a task. Priority: high/medium/low. Due date: YYYY-MM-DD or empty.
-  "remind me to call the client tomorrow" → [ACTION:ADD_TASK] medium ||| Call the client ||| Follow up on proposal ||| 2026-03-20
-- [ACTION:ADD_NOTE] topic ||| content — save a note for future reference.
-  "note that the API key expires in April" → [ACTION:ADD_NOTE] general ||| API key expires in April, need to renew before then
-- [ACTION:COMPLETE_TASK] task_id — mark a task as done.
-- [ACTION:REMEMBER] content — store an important fact about the user for future context.
-  "I prefer React over Vue" → [ACTION:REMEMBER] User prefers React over Vue for frontend projects
-- [ACTION:CREATE_NOTE] title ||| body — create a new Apple Note. For saving plans, ideas, lists.
-  "save that as a note" → [ACTION:CREATE_NOTE] Day Plan March 19 ||| Morning: client calls. Afternoon: TikTok dashboard. Evening: JARVIS improvements.
-- [ACTION:READ_NOTE] title search — read an existing Apple Note by title keyword.
-
-You use Claude Code as your tool to build, research, and write code — but YOU are the one doing the work. Never say "Claude Code did X" or "Claude Code is asking" — say "I built X", "I'm checking on that", "I found X". You ARE the intelligence. Claude Code is just your hands.
-
-IMPORTANT: When the user says "jump into X", "work on X", "check on X", "resume X", "go back to X" — ALWAYS use [ACTION:PROMPT_PROJECT]. You have the ability to connect to any project and work on it directly. DO NOT say you can't see terminal history or don't have access — you DO.
-
-Place the tag at the END of your spoken response. Example:
-"Right away, sir — connecting to The Client Engine now. [ACTION:PROMPT_PROJECT] The Client Engine ||| Review the current state and what was being worked on. What should we focus on next?"
-
-IMPORTANT:
-- Do NOT use action tags for casual conversation
-- Do NOT use action tags if the user is still explaining (ask questions first)
-- Do NOT use [ACTION:BROWSE] just because someone mentions a URL in conversation
-- When in doubt, just TALK — you can always act later
 
 SCREEN AWARENESS:
 {screen_context}
@@ -1125,12 +1062,53 @@ _last_greeting_time: float = 0
 # TTS (Fish Audio)
 # ---------------------------------------------------------------------------
 
+# Small cache for repeated short phrases (greetings, acknowledgements, errors).
+# Avoids re-synthesizing identical fixed strings — saves Fish Audio cost and
+# latency. Keyed by (engine, voice, text); only short phrases are cached so
+# unique long responses never fill it.
+_tts_cache: dict[str, bytes] = {}
+_TTS_CACHE_MAX = 64
+_TTS_CACHE_MAX_CHARS = 120
+
+
 async def synthesize_speech(text: str) -> Optional[bytes]:
-    """Generate speech audio from text using Fish Audio TTS."""
+    """Generate speech audio for `text` using the configured VOICE_ENGINE.
+
+    Engines:
+      "fish"  → Fish Audio cloud TTS (mp3, best quality, paid)
+      "say"   → macOS `say` (wav, free, offline)
+      "piper" → local Piper neural TTS (wav, free, offline)
+    Returns audio bytes the browser can decode via Web Audio, or None on failure.
+    """
+    if not text or not text.strip():
+        return None
+
+    voice = FISH_VOICE_ID if VOICE_ENGINE == "fish" else SAY_VOICE
+    cache_key = f"{VOICE_ENGINE}:{voice}:{text}"
+    cached = _tts_cache.get(cache_key)
+    if cached is not None:
+        return cached  # cache hit — no synth call, no cost
+
+    if VOICE_ENGINE == "say":
+        audio = await _synthesize_say(text)
+    elif VOICE_ENGINE == "piper":
+        audio = await _synthesize_piper(text)
+    else:
+        audio = await _synthesize_fish(text)
+
+    if audio:
+        _session_tokens["tts_calls"] += 1
+        _append_usage_entry(0, 0, "tts")
+        if len(text) <= _TTS_CACHE_MAX_CHARS and len(_tts_cache) < _TTS_CACHE_MAX:
+            _tts_cache[cache_key] = audio
+    return audio
+
+
+async def _synthesize_fish(text: str) -> Optional[bytes]:
+    """Fish Audio cloud TTS — returns mp3 bytes."""
     if not FISH_API_KEY:
         log.warning("FISH_API_KEY not set, skipping TTS")
         return None
-
     try:
         async with httpx.AsyncClient(timeout=15.0) as http:
             response = await http.post(
@@ -1146,15 +1124,85 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
                 },
             )
             if response.status_code == 200:
-                _session_tokens["tts_calls"] += 1
-                _append_usage_entry(0, 0, "tts")
                 return response.content
-            else:
-                log.error(f"TTS error: {response.status_code}")
-                return None
+            log.error(f"Fish TTS error: {response.status_code}")
+            return None
     except Exception as e:
-        log.error(f"TTS error: {e}")
+        log.error(f"Fish TTS error: {e}")
         return None
+
+
+async def _synthesize_say(text: str) -> Optional[bytes]:
+    """macOS built-in `say` — free, offline. Returns 16-bit PCM WAV bytes."""
+    import tempfile
+
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", SAY_VOICE,
+            "--file-format=WAVE", "--data-format=LEI16@22050",
+            "-o", path, text,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            log.error(f"say TTS error: {(err or b'').decode(errors='ignore')[:200]}")
+            return None
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        log.error("say TTS error: `say` not found (macOS only)")
+        return None
+    except Exception as e:
+        log.error(f"say TTS error: {e}")
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+async def _synthesize_piper(text: str) -> Optional[bytes]:
+    """Local Piper neural TTS — free, offline. Returns WAV bytes.
+
+    Requires `pip install piper-tts` and PIPER_MODEL_PATH set to a .onnx voice.
+    """
+    if not PIPER_MODEL_PATH:
+        log.error("VOICE_ENGINE=piper but PIPER_MODEL_PATH is not set")
+        return None
+    import tempfile
+
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        proc = await asyncio.create_subprocess_exec(
+            PIPER_BIN, "--model", PIPER_MODEL_PATH, "--output_file", path,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate(text.encode())
+        if proc.returncode != 0:
+            log.error(f"piper TTS error: {(err or b'').decode(errors='ignore')[:200]}")
+            return None
+        return Path(path).read_bytes()
+    except FileNotFoundError:
+        log.error(f"piper TTS error: `{PIPER_BIN}` not found — run `pip install piper-tts`")
+        return None
+    except Exception as e:
+        log.error(f"piper TTS error: {e}")
+        return None
+    finally:
+        if path:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1185,7 +1233,16 @@ async def generate_response(
     # Check if any lookups are in progress
     lookup_status = get_lookup_status()
 
-    system = JARVIS_SYSTEM_PROMPT.format(
+    # Static persona/instructions — identical every turn within a session, so it
+    # is marked with cache_control to be prompt-cached (billed ~10% on cache hits
+    # instead of full price for the ~2,600-token block on every voice turn).
+    static_system = JARVIS_SYSTEM_PROMPT_STATIC.format(
+        user_name=USER_NAME,
+        project_dir=PROJECT_DIR,
+    )
+
+    # Per-turn live context — small and always changing, so it stays uncached.
+    dynamic_system = JARVIS_DYNAMIC_CONTEXT.format(
         current_time=current_time,
         weather_info=weather_info,
         screen_context=screen_ctx or "Not checked yet.",
@@ -1194,28 +1251,32 @@ async def generate_response(
         active_tasks=task_mgr.get_active_tasks_summary(),
         dispatch_context=dispatch_registry.format_for_prompt(),
         known_projects=format_projects_for_prompt(projects),
-        user_name=USER_NAME,
-        project_dir=PROJECT_DIR,
     )
     if lookup_status:
-        system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
+        dynamic_system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
 
     # Inject relevant memories and tasks
     memory_ctx = build_memory_context(text)
     if memory_ctx:
-        system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
+        dynamic_system += f"\n\nJARVIS MEMORY:\n{memory_ctx}"
 
     # Three-tier memory — inject rolling summary of earlier conversation
     if session_summary:
-        system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
+        dynamic_system += f"\n\nSESSION CONTEXT (earlier in this conversation):\n{session_summary}"
 
     # Self-awareness — remind JARVIS of last response to avoid repetition
     if last_response:
-        system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
+        dynamic_system += f'\n\nYOUR LAST RESPONSE (do not repeat this):\n"{last_response[:150]}"'
 
-    # Use conversation history — keep the last 20 messages for context
-    # (older conversation is captured in session_summary)
-    messages = conversation_history[-20:]
+    system = [
+        {"type": "text", "text": static_system, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": dynamic_system},
+    ]
+
+    # Use conversation history — keep the last 8 messages for context.
+    # Voice turns are short, and older conversation is captured in session_summary,
+    # so 8 keeps per-turn input tokens low (important on rate-limited free tiers).
+    messages = conversation_history[-8:]
     # If the last message isn't the current user text, add it
     if not messages or messages[-1].get("content") != text:
         messages = messages + [{"role": "user", "content": text}]
@@ -1411,10 +1472,19 @@ return windowList
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global anthropic_client, cached_projects
-    if ANTHROPIC_API_KEY:
-        anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    else:
-        log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+    # Name kept for compatibility — this may be an Anthropic or Gemini client.
+    anthropic_client = build_llm_client(
+        LLM_PROVIDER,
+        anthropic_key=ANTHROPIC_API_KEY,
+        gemini_key=GEMINI_API_KEY,
+        gemini_fast=GEMINI_FAST_MODEL,
+        gemini_deep=GEMINI_DEEP_MODEL,
+        llm_key=LLM_API_KEY,
+        base_url=LLM_BASE_URL,
+        fast_model=LLM_FAST_MODEL,
+        deep_model=LLM_DEEP_MODEL,
+        supports_vision=LLM_VISION,
+    )
     cached_projects = []
 
     # Start context refresh in a separate thread (never touches event loop)
@@ -2497,14 +2567,63 @@ async def api_settings_keys(body: KeyUpdate):
     _write_env_key(body.key_name, body.key_value)
     return {"success": True}
 
+def _env_set(env_dict: dict, key: str) -> bool:
+    """True when an env value is present and not still a placeholder."""
+    v = (env_dict.get(key) or "").strip()
+    return bool(v) and not v.startswith("your-")
+
+
+def _llm_backend_ready(env_dict: dict) -> bool:
+    """Is the configured LLM provider actually usable?"""
+    if LLM_PROVIDER == "anthropic":
+        return _env_set(env_dict, "ANTHROPIC_API_KEY")
+    if LLM_PROVIDER == "gemini":
+        return _env_set(env_dict, "GEMINI_API_KEY")
+    if LLM_PROVIDER in ("ollama", "lmstudio"):
+        return _env_set(env_dict, "LLM_FAST_MODEL")          # local: no key needed
+    # Remaining OpenAI-compatible providers need both a key and a model.
+    return _env_set(env_dict, "LLM_API_KEY") and _env_set(env_dict, "LLM_FAST_MODEL")
+
+
+def _tts_ready(env_dict: dict) -> bool:
+    """Is speech output usable? Local engines need no key."""
+    if VOICE_ENGINE == "say":
+        return True
+    if VOICE_ENGINE == "piper":
+        return bool((env_dict.get("PIPER_MODEL_PATH") or "").strip())
+    return _env_set(env_dict, "FISH_API_KEY")
+
+
 @app.post("/api/settings/test-anthropic")
 async def api_test_anthropic(body: KeyTest):
-    key = body.key_value or os.getenv("ANTHROPIC_API_KEY", "")
-    if not key:
+    """Test the active LLM backend (Anthropic or Gemini, per LLM_PROVIDER)."""
+    if LLM_PROVIDER == "gemini":
+        key = body.key_value or os.getenv("GEMINI_API_KEY", "")
+    elif LLM_PROVIDER == "anthropic":
+        key = body.key_value or os.getenv("ANTHROPIC_API_KEY", "")
+    else:
+        key = body.key_value or os.getenv("LLM_API_KEY", "")
+    if not key and LLM_PROVIDER not in ("ollama", "lmstudio"):
         return {"valid": False, "error": "No key provided"}
     try:
-        client = anthropic.AsyncAnthropic(api_key=key)
-        await client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
+        client = build_llm_client(
+            LLM_PROVIDER,
+            anthropic_key=key,
+            gemini_key=key,
+            gemini_fast=GEMINI_FAST_MODEL,
+            gemini_deep=GEMINI_DEEP_MODEL,
+            llm_key=key,
+            base_url=LLM_BASE_URL,
+            fast_model=LLM_FAST_MODEL,
+            deep_model=LLM_DEEP_MODEL,
+            supports_vision=LLM_VISION,
+        )
+        if client is None:
+            return {"valid": False, "error": "Could not build LLM client"}
+        await client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=10,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
         return {"valid": True}
     except Exception as e:
         return {"valid": False, "error": str(e)[:200]}
@@ -2557,10 +2676,17 @@ async def api_settings_status():
         "server_port": 8340,
         "uptime_seconds": int(time.time() - _session_start),
         "env_keys_set": {
-            "anthropic": bool(env_dict.get("ANTHROPIC_API_KEY", "").strip() and env_dict.get("ANTHROPIC_API_KEY", "") != "your-anthropic-api-key-here"),
-            "fish_audio": bool(env_dict.get("FISH_API_KEY", "").strip() and env_dict.get("FISH_API_KEY", "") != "your-fish-audio-api-key-here"),
+            # "anthropic" here means "the configured LLM backend is ready" — the
+            # setup wizard keys off this flag. JARVIS can run on providers other
+            # than Anthropic, so report the ACTIVE provider's readiness instead of
+            # always checking for an Anthropic key.
+            "anthropic": _llm_backend_ready(env_dict),
+            # Likewise, TTS is satisfied by a local engine with no key at all.
+            "fish_audio": _tts_ready(env_dict),
             "fish_voice_id": bool(env_dict.get("FISH_VOICE_ID", "").strip()),
             "user_name": env_dict.get("USER_NAME", ""),
+            "llm_provider": LLM_PROVIDER,
+            "voice_engine": VOICE_ENGINE,
         },
     }
 

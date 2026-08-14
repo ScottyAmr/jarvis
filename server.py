@@ -47,12 +47,12 @@ from mail_access import get_unread_count, get_unread_messages, get_recent_messag
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
-    format_tasks_for_voice, extract_memories, get_important_memories,
+    format_tasks_for_voice, extract_memories, is_memory_worthy, get_important_memories,
 )
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
-from llm_provider import build_client as build_llm_client
+from llm_provider import build_client as build_llm_client, LLMError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -779,9 +779,12 @@ def extract_action(response: str) -> tuple[str, dict | None]:
 
     Returns (clean_text_for_tts, action_dict_or_none).
     """
+    # Tolerant of case and spacing — models (especially fallback ones) emit
+    # "[Action:REMEMBER]" or "[ ACTION: REMEMBER ]"; parse those too so a
+    # malformed tag is stripped from speech rather than spoken aloud.
     match = _action_re.search(
-        r'\[ACTION:(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\]\s*(.*?)$',
-        response, _action_re.DOTALL,
+        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\s*\]\s*(.*?)$',
+        response, _action_re.DOTALL | _action_re.IGNORECASE,
     )
     if match:
         action_type = match.group(1).lower()
@@ -1250,6 +1253,35 @@ async def _synthesize_piper(text: str) -> Optional[bytes]:
 # LLM Response
 # ---------------------------------------------------------------------------
 
+# One-time, next-step error messages. We speak a failure ONCE per kind, then
+# stay quiet on repeats of the same kind (return "") until a success resets it.
+_LLM_ERROR_MESSAGES = {
+    "auth": "My language provider is rejecting the key, sir — it needs checking in the settings.",
+    "rate_limit_daily": "I've reached today's free usage limit across all models, sir; it resets within the day, or add credit to continue now.",
+    "rate_limit_minute": "The provider is briefly rate-limited, sir — give it a moment.",
+    "server": "My language provider is having a server issue, sir; worth a retry shortly.",
+    "timeout": "The language provider isn't responding in time, sir — the connection may be slow.",
+    "network": "I can't reach the language provider, sir — likely a network drop.",
+    "unknown": "I'm having trouble reaching my language systems, sir.",
+}
+_last_llm_error_kind: str | None = None
+
+
+def _clear_llm_error():
+    global _last_llm_error_kind
+    _last_llm_error_kind = None
+
+
+def _llm_error_response(kind: str) -> str:
+    """Return a spoken message the first time a failure kind occurs; empty on
+    repeats of the same kind so JARVIS explains once and then waits."""
+    global _last_llm_error_kind
+    if kind == _last_llm_error_kind:
+        return ""  # already explained this — stay quiet
+    _last_llm_error_kind = kind
+    return _LLM_ERROR_MESSAGES.get(kind, _LLM_ERROR_MESSAGES["unknown"])
+
+
 async def generate_response(
     text: str,
     client: anthropic.AsyncAnthropic,
@@ -1330,10 +1362,12 @@ async def generate_response(
             messages=messages,
         )
         track_usage(response)
+        _clear_llm_error()  # recovered — allow the next distinct error to speak
         return response.content[0].text
     except Exception as e:
-        log.error(f"LLM error: {e}")
-        return "Apologies, sir. I'm having trouble connecting to my language systems."
+        kind = getattr(e, "kind", "unknown") if isinstance(e, LLMError) else "unknown"
+        log.error(f"LLM error [{kind}]: {e}")
+        return _llm_error_response(kind)
 
 
 # ---------------------------------------------------------------------------
@@ -2540,21 +2574,29 @@ async def voice_handler(ws: WebSocket):
                     else:
                         summary_update_pending = False
 
-                # Extract memories in background (doesn't block response)
-                if anthropic_client and len(user_text) > 15:
+                # Extract memories in background — ONLY when the message looks
+                # durable (a preference/decision/fact/instruction). Skips the
+                # second model call entirely for casual/filler turns.
+                if anthropic_client and is_memory_worthy(user_text):
+                    log.info("memory: worthy — extracting")
                     asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
 
-                # TTS
-                tts = strip_markdown_for_tts(response_text)
-                await ws.send_json({"type": "status", "state": "speaking"})
-                audio = await synthesize_speech(tts)
-                if audio:
-                    await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
-                else:
-                    await ws.send_json({"type": "text", "text": response_text})
+                # Empty response = a deduped repeat error ("explain once, then
+                # wait"). Go idle silently instead of speaking the same failure.
+                if not response_text.strip():
                     await ws.send_json({"type": "status", "state": "idle"})
-                log.info(f"JARVIS: {response_text}")
-                last_jarvis_response = response_text
+                else:
+                    # TTS
+                    tts = strip_markdown_for_tts(response_text)
+                    await ws.send_json({"type": "status", "state": "speaking"})
+                    audio = await synthesize_speech(tts)
+                    if audio:
+                        await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": response_text})
+                    else:
+                        await ws.send_json({"type": "text", "text": response_text})
+                        await ws.send_json({"type": "status", "state": "idle"})
+                    log.info(f"JARVIS: {response_text}")
+                    last_jarvis_response = response_text
 
             except Exception as e:
                 log.error(f"Error: {e}", exc_info=True)

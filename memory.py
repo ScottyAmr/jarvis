@@ -12,6 +12,7 @@ so JARVIS gets smarter over time.
 
 import json
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -93,9 +94,29 @@ def init_db():
 # Memories — facts JARVIS learns
 # ---------------------------------------------------------------------------
 
+def _norm_mem(s: str) -> str:
+    """Normalise memory content for duplicate detection."""
+    return re.sub(r"[^a-z0-9 ]", "", (s or "").lower()).strip()
+
+
 def remember(content: str, mem_type: str = "fact", source: str = "", importance: int = 5) -> int:
-    """Store a memory. Returns the memory ID."""
+    """Store a memory, skipping near-duplicates. Returns the memory ID
+    (or the existing id if a duplicate is found)."""
     conn = _get_db()
+
+    # Dedup: skip if an equivalent memory already exists (normalised match,
+    # or one fully contains the other) among recent entries.
+    norm = _norm_mem(content)
+    if norm:
+        for row in conn.execute(
+            "SELECT id, content FROM memories ORDER BY id DESC LIMIT 200"
+        ):
+            other = _norm_mem(row["content"])
+            if other and (other == norm or norm in other or other in norm):
+                conn.close()
+                log.info(f"Memory dedup — skipped near-duplicate: {content[:60]}")
+                return row["id"]
+
     cur = conn.execute(
         "INSERT INTO memories (type, content, source, importance, created_at) VALUES (?, ?, ?, ?, ?)",
         (mem_type, content, source, importance, time.time())
@@ -401,6 +422,36 @@ def format_plan_for_voice(tasks: list[dict], events: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 # Memory extraction — learn from conversations
 # ---------------------------------------------------------------------------
+
+# Durable-signal phrases. If none are present, the turn is casual/filler and we
+# skip the extraction model call entirely (memory efficiency).
+_MEMORY_SIGNALS = re.compile(
+    r"\b("
+    r"remember|note that|don't forget|do not forget|keep in mind|for (future|later)|make a note|"
+    r"i prefer|i'd prefer|i like|i love|i hate|i don'?t like|i'd rather|my favou?rite|"
+    r"always|never|from now on|going forward|by default|default behavio|make sure|your job|you should|"
+    r"stop saying|don'?t say|call me|my name is|i am a |i'm a |i work|i live|my email|my number|my goal|"
+    r"i decided|let'?s go with|we'?ll use|we should use|the plan is|"
+    r"this project|the project|we'?re building|the goal is|prioriti[sz]e|"
+    r"set (up|a) (default|rule|preference)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_memory_worthy(user_text: str) -> bool:
+    """Cheap pre-filter: is this message likely to contain something durable?
+
+    Returns True only for messages long enough and carrying a durable signal
+    (preference, decision, personal fact, project detail, or an explicit
+    instruction to remember). Casual chat, filler, and short replies return
+    False, so no second model call is made for them.
+    """
+    t = (user_text or "").strip()
+    if len(t) < 12:
+        return False
+    return bool(_MEMORY_SIGNALS.search(t))
+
 
 async def extract_memories(user_text: str, jarvis_response: str, anthropic_client) -> list[str]:
     """After a conversation turn, extract any facts worth remembering.

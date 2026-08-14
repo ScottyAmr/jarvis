@@ -68,6 +68,37 @@ class _Response:
         self.stop_reason = stop_reason
 
 
+class LLMError(Exception):
+    """Classified LLM failure. `.kind` is one of:
+    auth | rate_limit_daily | rate_limit_minute | server | timeout | network | unknown
+    """
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+def classify_http_status(status: int, body: str) -> str:
+    """Map an HTTP failure to an LLMError kind."""
+    b = (body or "").lower()
+    if status in (401, 403):
+        return "auth"
+    if status == 429:
+        return "rate_limit_daily" if ("per day" in b or "tpd" in b) else "rate_limit_minute"
+    if 500 <= status < 600:
+        return "server"
+    return "unknown"
+
+
+def classify_exception(exc: Exception) -> str:
+    """Map a transport exception to an LLMError kind."""
+    if isinstance(exc, (httpx.TimeoutException,)):
+        return "timeout"
+    if isinstance(exc, (httpx.TransportError, httpx.ConnectError, httpx.NetworkError)):
+        return "network"
+    return "unknown"
+
+
 # --------------------------------------------------------------------------
 # Gemini
 # --------------------------------------------------------------------------
@@ -377,17 +408,18 @@ class _CompatMessages:
             headers["HTTP-Referer"] = "http://localhost:5173"
             headers["X-Title"] = "JARVIS"
 
-        # Try the primary model, then each fallback. Each model has its own
-        # daily/minute quota, so a fallback recovers a rate-limited primary.
-        models_to_try = [target]
-        for fb in c.fallback_models:
-            if fb and fb not in models_to_try:
-                models_to_try.append(fb)
+        # Build the model order: the session's active model first (sticky —
+        # a fallback that already worked stays selected), then primary, then
+        # the remaining fallbacks. Each model has its own daily/minute quota.
+        ordered = [c.active_model or target, target] + list(c.fallback_models)
+        models_to_try: list[str] = []
+        for m in ordered:
+            if m and m not in models_to_try:
+                models_to_try.append(m)
 
         resp = None
-        used_model = target
-        last_err = "no response"
-        rate_limited = False
+        last_kind = "unknown"
+        last_detail = "no response"
         async with httpx.AsyncClient(timeout=c.timeout) as http:
             for mi, mdl in enumerate(models_to_try):
                 payload: dict[str, Any] = {"model": mdl, "messages": chat, "max_tokens": max_tokens}
@@ -397,47 +429,54 @@ class _CompatMessages:
                 if temperature is not None:
                     payload["temperature"] = temperature
 
+                # One model: transient failures (minute-429, 5xx, timeout,
+                # network) get a couple of short retries; hard failures
+                # (auth, daily-429) fall through immediately.
                 attempt = 0
+                kind = "unknown"
+                resp = None
                 while True:
-                    resp = await http.post(
-                        f"{c.base_url}/chat/completions", json=payload, headers=headers
-                    )
-                    if resp.status_code != 429:
+                    try:
+                        resp = await http.post(
+                            f"{c.base_url}/chat/completions", json=payload, headers=headers
+                        )
+                    except Exception as e:  # timeout / network
+                        kind = classify_exception(e)
+                        last_kind, last_detail = kind, f"{type(e).__name__}: {e}"
+                        resp = None
+                    else:
+                        if resp.status_code == 200:
+                            break
+                        kind = classify_http_status(resp.status_code, resp.text)
+                        last_kind = kind
+                        last_detail = f"HTTP {resp.status_code} on '{mdl}': {resp.text[:160]}"
+
+                    transient = kind in ("rate_limit_minute", "server", "timeout", "network")
+                    if not transient or attempt >= RATE_LIMIT_MAX_RETRIES:
                         break
-                    # A per-DAY cap won't clear in seconds — skip retries, fall back.
-                    body = resp.text.lower()
-                    daily = "per day" in body or "tpd" in body
-                    if daily or attempt >= RATE_LIMIT_MAX_RETRIES:
-                        break
-                    wait = min(_retry_after_seconds(resp) + 0.25, RATE_LIMIT_MAX_WAIT)
+                    wait = min(_retry_after_seconds(resp) + 0.25, RATE_LIMIT_MAX_WAIT) if resp is not None else 1.0
                     attempt += 1
-                    log.warning(
-                        f"{c.provider} rate-limited (429) on {mdl}; waiting "
-                        f"{wait:.1f}s and retrying ({attempt}/{RATE_LIMIT_MAX_RETRIES})"
-                    )
+                    log.warning(f"{c.provider}/{mdl} {kind}; retry {attempt}/{RATE_LIMIT_MAX_RETRIES} in {wait:.1f}s")
                     await asyncio.sleep(wait)
 
-                if resp.status_code == 200:
-                    used_model = mdl
+                if resp is not None and resp.status_code == 200:
+                    if c.active_model != mdl:
+                        log.info(f"{c.provider}: model now '{mdl}'"
+                                 + (f" (fell back from '{models_to_try[0]}' — {last_kind})" if mi > 0 else ""))
+                        c.active_model = mdl  # sticky for the rest of the session
                     break
-                last_err = f"{resp.status_code} on '{mdl}': {resp.text[:180]}"
-                if resp.status_code == 429:
-                    rate_limited = True
-                    if mi < len(models_to_try) - 1:
-                        log.warning(f"{c.provider}: {mdl} rate-limited — falling back to {models_to_try[mi + 1]}")
-                        continue
-                break  # non-429 error, or no models left
+
+                # this model failed — auth won't be fixed by another model
+                if kind == "auth":
+                    raise LLMError("auth", f"{c.provider} authentication failed: {last_detail}")
+                if mi < len(models_to_try) - 1:
+                    log.warning(f"{c.provider}: '{mdl}' failed ({kind}) — falling back to '{models_to_try[mi + 1]}'")
+                    continue
 
         if resp is None or resp.status_code != 200:
-            if rate_limited:
-                raise RuntimeError(
-                    f"{c.provider} rate limit exhausted across all models "
-                    f"({', '.join(models_to_try)}) — daily free-tier quota reached. "
-                    f"Last: {last_err}"
-                )
-            raise RuntimeError(f"{c.provider} API error {last_err}")
+            raise LLMError(last_kind, f"{c.provider}: all models failed ({', '.join(models_to_try)}). {last_detail}")
 
-        target = used_model  # for the empty-content diagnostics below
+        target = c.active_model or target  # for the empty-content diagnostics below
         data = resp.json()
         choices = data.get("choices") or []
         text = ""
@@ -489,6 +528,7 @@ class AsyncOpenAICompat:
         self.deep_model = deep_model or fast_model
         self.supports_vision = supports_vision
         self.fallback_models = fallback_models or []
+        self.active_model: Optional[str] = None  # sticky: last model that worked
         self.timeout = timeout
         self.messages = _CompatMessages(self)
         if not self.base_url:

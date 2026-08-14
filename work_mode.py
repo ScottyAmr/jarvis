@@ -16,6 +16,20 @@ import os
 import shutil
 from pathlib import Path
 
+
+def _claude_env() -> dict:
+    """Environment for the `claude` CLI subprocess.
+
+    Strip Anthropic API auth so Claude Code uses the user's claude.ai LOGIN
+    (subscription) instead of an ANTHROPIC_API_KEY inherited from JARVIS's .env
+    — which for Groq/other users is a placeholder and makes `claude -p` fail
+    with "connectors are disabled because ANTHROPIC_API_KEY ... is set".
+    """
+    env = dict(os.environ)
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        env.pop(k, None)
+    return env
+
 log = logging.getLogger("jarvis.work_mode")
 
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
@@ -85,6 +99,7 @@ class WorkSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._working_dir,
+                env=_claude_env(),
             )
 
             stdout, stderr = await asyncio.wait_for(

@@ -24,7 +24,11 @@ if _env_path.exists():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+            _v = _v.strip().strip('"').strip("'")
+            # Skip unfilled placeholders (e.g. ANTHROPIC_API_KEY=your-...-here) so
+            # they never pollute the environment or leak into subprocesses.
+            if _v and not _v.startswith("your-"):
+                os.environ.setdefault(_k.strip(), _v)
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, asdict
@@ -1000,10 +1004,16 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                 dispatch_registry.update_status(dispatch_id, "completed",
                     response=full_response[:2000], summary=f"Running at {url}")
 
+        is_repeat_error = False
         if not full_response or full_response.startswith("Hit a problem") or full_response.startswith("That's taking"):
             dispatch_registry.update_status(dispatch_id, "failed" if full_response else "timeout", response=full_response or "")
             msg = f"Sir, I ran into an issue with {project_name}. {full_response[:150] if full_response else 'No response received.'}"
+            # Explain a given failure once; stay quiet on identical repeats.
+            sig = (full_response or "")[:120]
+            is_repeat_error = _last_dispatch_error.get(project_name) == sig
+            _last_dispatch_error[project_name] = sig
         else:
+            _last_dispatch_error.pop(project_name, None)  # recovered
             # Summarize via Haiku — don't read word for word
             if anthropic_client:
                 try:
@@ -1030,7 +1040,9 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
 
         # Speak the result — skip if user has spoken recently to avoid audio collision
         log.info(f"Dispatch summary for {project_name}: {msg[:100]}")
-        if voice_state and time.time() - voice_state["last_user_time"] < 3:
+        if is_repeat_error:
+            log.info(f"Skipping dispatch audio for {project_name} — same failure already reported")
+        elif voice_state and time.time() - voice_state["last_user_time"] < 3:
             log.info(f"Skipping dispatch audio for {project_name} — user spoke recently")
             # Result is still stored in history below so JARVIS can reference it
         else:
@@ -1265,6 +1277,9 @@ _LLM_ERROR_MESSAGES = {
     "unknown": "I'm having trouble reaching my language systems, sir.",
 }
 _last_llm_error_kind: str | None = None
+# Per-project last dispatch-failure signature, so an identical failure is
+# reported once and not repeated on retries.
+_last_dispatch_error: dict[str, str] = {}
 
 
 def _clear_llm_error():

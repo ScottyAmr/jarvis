@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1722,6 +1723,68 @@ async def api_context():
     }
 
 
+async def _compose_brief() -> dict:
+    """Compose a briefing from cached context — fast, no blocking AppleScript.
+
+    Powers both the /api/brief endpoint (dashboard) and the "brief me" voice
+    command, so the spoken and on-screen briefs always match.
+    """
+    now = datetime.now()
+    hour = now.hour
+    greeting = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+
+    weather = _ctx_cache.get("weather", "")
+    try:
+        events = await get_todays_events()
+    except Exception:
+        events = []
+    try:
+        nxt = await get_next_event()
+    except Exception:
+        nxt = None
+    try:
+        tasks = get_open_tasks()
+    except Exception:
+        tasks = []
+
+    mail = _ctx_cache.get("mail", "")
+    m = re.search(r"(\d[\d,]*)\s+unread", mail, re.IGNORECASE)
+    unread = int(m.group(1).replace(",", "")) if m else 0
+
+    # Spoken rundown — a brief may run a little longer than a normal reply.
+    parts = [f"{greeting}, {USER_NAME}."]
+    w = weather.split(".")[0].strip() if weather else ""
+    if w and "unavailable" not in w.lower():
+        parts.append(w + ".")
+    if nxt and nxt.get("title"):
+        t = nxt.get("time") or ""
+        parts.append(f"Next up, {nxt['title']} at {t}." if t else f"Next up, {nxt['title']}.")
+    elif not events:
+        parts.append("Your calendar is clear today.")
+    if unread:
+        parts.append(f"{unread} unread message{'s' if unread != 1 else ''}.")
+    if tasks:
+        parts.append(f"Top task: {tasks[0].get('title', '')}.")
+    else:
+        parts.append("No open tasks.")
+
+    return {
+        "greeting": greeting,
+        "user_name": USER_NAME,
+        "weather": weather,
+        "events": events,
+        "next_event": nxt,
+        "unread_count": unread,
+        "tasks": tasks[:5],
+        "spoken": " ".join(parts),
+    }
+
+
+@app.get("/api/brief")
+async def api_brief():
+    return await _compose_brief()
+
+
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
@@ -1769,6 +1832,13 @@ def detect_action_fast(text: str) -> dict | None:
                              "can you see my screen", "look at my screen", "what am i looking at",
                              "what's open", "whats open", "what apps are open"]):
         return {"action": "describe_screen"}
+
+    # Briefing — a full rundown of the day
+    if any(p in t for p in ["brief me", "morning brief", "daily brief", "morning briefing",
+                            "give me a brief", "give me the rundown", "give me a rundown",
+                            "what's my day", "whats my day", "catch me up", "the rundown",
+                            "brief me in", "sitrep", "sit rep"]):
+        return {"action": "brief"}
 
     # Calendar — explicit schedule requests
     if any(p in t for p in ["what's my schedule", "whats my schedule", "what's on my calendar",
@@ -2430,6 +2500,8 @@ async def voice_handler(ws: WebSocket):
                                     response_text = f"{name} ran into problems, sir."
                                 else:
                                     response_text = f"{name} is {status}, sir."
+                        elif action["action"] == "brief":
+                            response_text = (await _compose_brief())["spoken"]
                         elif action["action"] == "check_tasks":
                             tasks = get_open_tasks()
                             response_text = format_tasks_for_voice(tasks)

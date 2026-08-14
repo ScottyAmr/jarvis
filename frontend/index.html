@@ -35,6 +35,70 @@
     <div id="status-text"></div>
     <div id="jarvis-label">JARVIS</div>
     <div id="error-text"></div>
+
+    <!-- ===== Ambient edge readouts (around the orb) ===== -->
+    <div class="hud-corner tl" id="hud-clock">
+      <div class="hud-time" id="hud-time">--:--:--</div>
+      <div class="hud-sub" id="hud-date">— — —</div>
+    </div>
+
+    <div class="hud-corner tr" id="hud-status">
+      <div class="hud-chip"><i id="dot-conn"></i><span id="conn-label">connecting</span></div>
+      <div class="hud-chip"><i class="c-cyan"></i><span id="prov-label">—</span></div>
+      <div class="hud-chip"><i class="c-violet"></i><span id="voice-label">—</span></div>
+    </div>
+
+    <div class="hud-corner bl" id="hud-ambient">
+      <div class="hud-weather" id="hud-weather">—</div>
+      <div class="hud-sub" id="hud-next">—</div>
+    </div>
+
+    <div class="hud-corner br" id="hud-counts">
+      <button id="btn-dashboard" title="Open dashboard">
+        <span class="dash-ico">▦</span> DASHBOARD
+      </button>
+      <div class="hud-metrics">
+        <span><b id="m-mail">0</b> mail</span>
+        <span><b id="m-tasks">0</b> tasks</span>
+        <span><b id="m-mem">0</b> mem</span>
+      </div>
+    </div>
+
+    <!-- ===== Dashboard overlay ===== -->
+    <div id="dashboard" class="dash-hidden">
+      <div class="dash-head">
+        <div class="dash-title">JARVIS <span>· OPERATIONS</span></div>
+        <div class="dash-clock" id="dash-clock">--:--:--</div>
+        <button id="btn-dash-close" title="Close">✕</button>
+      </div>
+      <div class="dash-grid">
+        <section class="dash-card" style="--accent:var(--violet)">
+          <h3>Schedule <em id="dash-sched-count"></em></h3>
+          <div id="dash-schedule" class="dash-body">Loading…</div>
+        </section>
+        <section class="dash-card" style="--accent:var(--magenta)">
+          <h3>Mail <em id="dash-mail-count"></em></h3>
+          <div id="dash-mail" class="dash-body">Loading…</div>
+        </section>
+        <section class="dash-card" style="--accent:var(--cyan)">
+          <h3>Tasks <em id="dash-task-count"></em></h3>
+          <div id="dash-tasks" class="dash-body">Loading…</div>
+        </section>
+        <section class="dash-card" style="--accent:var(--amber)">
+          <h3>Weather</h3>
+          <div id="dash-weather" class="dash-body">Loading…</div>
+        </section>
+        <section class="dash-card" style="--accent:var(--green)">
+          <h3>Projects <em id="dash-proj-count"></em></h3>
+          <div id="dash-projects" class="dash-body">Loading…</div>
+        </section>
+        <section class="dash-card" style="--accent:var(--cyan)">
+          <h3>System</h3>
+          <div id="dash-system" class="dash-body">Loading…</div>
+        </section>
+      </div>
+    </div>
+
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

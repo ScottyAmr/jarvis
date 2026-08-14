@@ -9,6 +9,7 @@ import { createOrb, type OrbState } from "./orb";
 import { createVoiceInput, createAudioPlayer } from "./voice";
 import { createSocket } from "./ws";
 import { openSettings, checkFirstTimeSetup } from "./settings";
+import { initDashboard, setConnState } from "./dashboard";
 import "./style.css";
 
 // ---------------------------------------------------------------------------
@@ -284,3 +285,7 @@ btnSettings.addEventListener("click", (e) => {
 setTimeout(() => {
   checkFirstTimeSetup();
 }, 2000);
+
+// Ambient edge readouts + dashboard overlay
+initDashboard();
+setInterval(() => setConnState(socket.isConnected()), 1000);

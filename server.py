@@ -1616,6 +1616,42 @@ async def api_list_projects():
     return {"projects": cached_projects}
 
 
+@app.get("/api/context")
+async def api_context():
+    """Live ambient context for the UI (edge readouts + dashboard).
+
+    Reads the background-refreshed cache (never blocks) and adds today's
+    structured events and the next upcoming event.
+    """
+    try:
+        events = await get_todays_events()
+    except Exception:
+        events = []
+    try:
+        nxt = await get_next_event()
+    except Exception:
+        nxt = None
+    try:
+        unread = await get_unread_count()
+    except Exception:
+        unread = {}
+    try:
+        todos = get_open_tasks()
+    except Exception:
+        todos = []
+    return {
+        "weather": _ctx_cache.get("weather", ""),
+        "calendar": _ctx_cache.get("calendar", ""),
+        "mail": _ctx_cache.get("mail", ""),
+        "screen": _ctx_cache.get("screen", ""),
+        "events": events,
+        "next_event": nxt,
+        "unread_count": unread.get("count", 0) if isinstance(unread, dict) else 0,
+        "tasks": todos,
+        "user_name": USER_NAME,
+    }
+
+
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:

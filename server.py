@@ -815,6 +815,12 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     if match:
         action_type = match.group(1).lower()
         action_target = match.group(2).strip()
+        # Strip any secondary action tags the LLM may have appended after the first
+        secondary = _action_re.search(
+            r'\[\s*ACTION\s*:', action_target, _action_re.IGNORECASE,
+        )
+        if secondary:
+            action_target = action_target[:secondary.start()].strip()
         clean_text = response[:match.start()].strip()
         return clean_text, {"action": action_type, "target": action_target}
     return response, None
@@ -2799,10 +2805,15 @@ async def voice_handler(ws: WebSocket):
                                     target = embedded_action["target"]
                                     parts = target.split("|||")
                                     if len(parts) >= 2:
-                                        priority = parts[0].strip() or "medium"
+                                        priority = parts[0].strip().lower()
+                                        if priority not in ("high", "medium", "low"):
+                                            priority = "medium"
                                         title = parts[1].strip()
                                         desc = parts[2].strip() if len(parts) > 2 else ""
                                         due = parts[3].strip() if len(parts) > 3 else ""
+                                        # Sanitize due_date: only keep YYYY-MM-DD pattern
+                                        due_match = re.match(r"(\d{4}-\d{2}-\d{2})", due)
+                                        due = due_match.group(1) if due_match else ""
                                         create_task(title=title, description=desc, priority=priority, due_date=due)
                                         log.info(f"Task created: {title}")
                                 elif embedded_action["action"] == "add_note":

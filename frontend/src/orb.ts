@@ -116,20 +116,14 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
   halo.scale.set(64, 64, 1);
   scene.add(halo);
 
-  // ── Heartbeat ping rings ──
-  interface Ping { mesh: THREE.Mesh; t: number; }
-  const pings: Ping[] = [];
-  const ringMat = new THREE.MeshBasicMaterial({
-    color: 0x35d6ff, transparent: true, opacity: 0, side: THREE.DoubleSide,
-    blending: THREE.AdditiveBlending, depthWrite: false,
+  // ── Ambient inner glow (replaces expanding rings) ──
+  const innerGlowMat = new THREE.SpriteMaterial({
+    map: coreMat.map, color: 0x35d6ff, transparent: true,
+    blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0,
   });
-  for (let i = 0; i < 3; i++) {
-    const m = new THREE.Mesh(new THREE.RingGeometry(0.92, 1.0, 96), ringMat.clone());
-    m.visible = false;
-    scene.add(m);
-    pings.push({ mesh: m, t: 1 });
-  }
-  let lastPing = 0;
+  const innerGlow = new THREE.Sprite(innerGlowMat);
+  innerGlow.scale.set(40, 40, 1);
+  scene.add(innerGlow);
 
   // ── State configs ──
   const STATES: Record<OrbState, StateCfg> = {
@@ -152,14 +146,7 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
 
   const clock = new THREE.Clock();
 
-  function spawnPing(t: number, color: THREE.Color) {
-    const p = pings.find((p) => p.t >= 1);
-    if (!p) return;
-    p.t = 0;
-    p.mesh.visible = true;
-    (p.mesh.material as THREE.MeshBasicMaterial).color.copy(color);
-    lastPing = t;
-  }
+  // (ping system removed — ambient inner glow replaces it)
 
   function animate() {
     if (destroyed) return;
@@ -249,17 +236,12 @@ export function createOrb(canvas: HTMLCanvasElement): Orb {
     haloMat.color.copy(col);
     haloMat.opacity = 0.18 + bright * 0.12;
 
-    // ── heartbeat pings ──
-    const pingGap = state === "thinking" ? 0.9 : state === "speaking" ? 1.0 : 1.6;
-    if (t - lastPing > pingGap) spawnPing(t, col);
-    for (const p of pings) {
-      if (p.t >= 1) { p.mesh.visible = false; continue; }
-      p.t += 0.016 / (state === "idle" ? 1.6 : 1.1);
-      const scl = liveR * (0.9 + p.t * 1.7);
-      p.mesh.scale.setScalar(scl);
-      p.mesh.lookAt(camera.position);
-      (p.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - p.t) * 0.5;
-    }
+    // ── ambient inner glow pulse (smooth, no expanding rings) ──
+    const glowPulse = 0.5 + Math.sin(t * (state === "thinking" ? 2.5 : 1.2)) * 0.5;
+    innerGlowMat.color.copy(col);
+    innerGlowMat.opacity = glowPulse * (state === "idle" ? 0.08 : state === "thinking" ? 0.18 : 0.12) + amp * 0.1;
+    innerGlow.scale.setScalar(liveR * 1.6 + bass * 4);
+    innerGlow.position.set(0, 0, 0);
 
     camera.position.x = Math.sin(t * 0.05) * 4;
     camera.position.y = Math.cos(t * 0.04) * 2.5;

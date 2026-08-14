@@ -31,6 +31,18 @@ function showError(msg: string) {
   }, 5000);
 }
 
+function showToast(msg: string) {
+  const el = document.createElement("div");
+  el.className = "jarvis-toast";
+  el.textContent = msg;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add("show"));
+  setTimeout(() => {
+    el.classList.remove("show");
+    setTimeout(() => el.remove(), 400);
+  }, 6000);
+}
+
 function updateStatus(state: State) {
   const labels: Record<State, string> = {
     idle: "",
@@ -189,6 +201,10 @@ socket.onMessage((msg) => {
   } else if (type === "text") {
     // Text fallback when TTS fails
     console.log("[JARVIS]", msg.text);
+  } else if (type === "reminder") {
+    const title = (msg.title as string) || "Task due";
+    const due = (msg.due_time as string) || "";
+    showToast(`⏰ ${title}${due ? ` — due ${due}` : ""}`);
   } else if (type === "task_spawned") {
     console.log("[task]", "spawned:", msg.task_id, msg.prompt);
   } else if (type === "task_complete") {

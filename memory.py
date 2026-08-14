@@ -250,6 +250,23 @@ def get_tasks_for_date(date_str: str) -> list[dict]:
     return [dict(r) for r in results]
 
 
+def get_due_soon(minutes: int = 5) -> list[dict]:
+    """Get open tasks with due_time within the next N minutes (today only)."""
+    now = datetime.now()
+    today = now.strftime("%Y-%m-%d")
+    hhmm_now = now.strftime("%H:%M")
+    end = (now + timedelta(minutes=minutes)).strftime("%H:%M")
+    conn = _get_db()
+    results = conn.execute(
+        "SELECT * FROM tasks WHERE due_date = ? AND due_time != '' "
+        "AND due_time >= ? AND due_time <= ? AND status IN ('open', 'in_progress') "
+        "ORDER BY due_time",
+        (today, hhmm_now, end),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in results]
+
+
 def complete_task(task_id: int):
     """Mark a task as done."""
     conn = _get_db()

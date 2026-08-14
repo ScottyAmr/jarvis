@@ -97,10 +97,22 @@ async function refresh() {
         ? ev.map((e) => `<div class="row"><span class="t">${esc(e.time || e.start || "")}</span><span>${esc(e.title || "Untitled")}${e.location ? ` <span class="muted">· ${esc(e.location)}</span>` : ""}</span></div>`).join("")
         : `<span class="muted">Nothing scheduled today.</span>`;
     }
-    // Mail
+    // Mail — show sender + subject for each unread
     setText("dash-mail-count", ctx.unread_count != null ? `${ctx.unread_count} unread` : "");
     const mail = $("dash-mail");
-    if (mail) mail.innerHTML = `<div class="big">${ctx.unread_count ?? 0}</div><div class="muted">${esc((ctx.mail || "").split("\n")[0] || "unread messages")}</div>`;
+    if (mail) {
+      const mailLines = (ctx.mail || "").split("\n").filter((l: string) => l.trim());
+      if (mailLines.length > 1) {
+        mail.innerHTML = mailLines.slice(0, 10).map((l: string) => {
+          const parts = l.split(":");
+          const sender = esc(parts[0] || "").trim();
+          const subj = esc(parts.slice(1).join(":") || "").trim();
+          return `<div class="row"><span class="t">${sender}</span><span>${subj}</span></div>`;
+        }).join("");
+      } else {
+        mail.innerHTML = `<div class="big">${ctx.unread_count ?? 0}</div><div class="muted">unread messages</div>`;
+      }
+    }
     // Tasks
     const tk = ctx.tasks || [];
     setText("dash-task-count", tk.length ? `${tk.length} open` : "");

@@ -513,3 +513,28 @@ html, body {
 .dash-body .t { color: var(--accent); font-variant-numeric: tabular-nums; flex: none; }
 .dash-body .muted { color: var(--hud-dim); }
 .dash-body .big { font-size: 26px; color: #fff; font-weight: 600; }
+
+/* Toast notifications (reminders) */
+.jarvis-toast {
+  position: fixed;
+  top: 24px;
+  left: 50%;
+  transform: translateX(-50%) translateY(-20px);
+  background: rgba(10, 14, 20, 0.92);
+  border: 1px solid var(--cyan);
+  color: var(--hud-ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 10px 22px;
+  border-radius: 6px;
+  opacity: 0;
+  transition: opacity 0.35s, transform 0.35s;
+  z-index: 9999;
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: 0 0 20px rgba(53, 214, 255, 0.25);
+}
+.jarvis-toast.show {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}

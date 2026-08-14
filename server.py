@@ -53,6 +53,7 @@ from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, is_memory_worthy, get_important_memories,
+    get_due_soon,
 )
 from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
@@ -1413,6 +1414,7 @@ anthropic_client: Optional[anthropic.AsyncAnthropic] = None
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
+_reminder_fired: set[int] = set()  # task IDs already notified this session
 
 # Usage tracking — logs every call with timestamp, persists to disk
 _USAGE_FILE = Path(__file__).parent / "data" / "usage_log.jsonl"
@@ -1600,7 +1602,12 @@ async def lifespan(application: FastAPI):
     _refresh_context_sync()
     log.info("JARVIS server starting")
 
+    # Background reminder loop (fires macOS notifications for due tasks)
+    reminder_task = asyncio.create_task(_reminder_loop())
+
     yield
+
+    reminder_task.cancel()
 
 
 app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
@@ -1785,6 +1792,89 @@ async def api_brief():
     return await _compose_brief()
 
 
+async def _compose_inbox_summary() -> str:
+    """Build a spoken digest of unread email grouped by sender."""
+    try:
+        msgs = await get_unread_messages(count=30)
+    except Exception:
+        return "I couldn't reach Mail at the moment, sir."
+    if not msgs:
+        return "Your inbox is clear, sir. No unread messages."
+
+    by_sender: dict[str, list[str]] = {}
+    for m in msgs:
+        name = m["sender"].split("<")[0].strip().strip('"')
+        if not name:
+            name = m["sender"]
+        by_sender.setdefault(name, []).append(m.get("subject", "(no subject)"))
+
+    parts = [f"You have {len(msgs)} unread message{'s' if len(msgs) != 1 else ''}."]
+    for sender, subjects in list(by_sender.items())[:8]:
+        if len(subjects) == 1:
+            parts.append(f"From {sender}: {subjects[0]}.")
+        else:
+            parts.append(f"{len(subjects)} from {sender}, including {subjects[0]}.")
+    if len(by_sender) > 8:
+        parts.append(f"Plus {len(by_sender) - 8} more senders.")
+    return " ".join(parts)
+
+
+@app.get("/api/inbox-summary")
+async def api_inbox_summary():
+    return {"spoken": await _compose_inbox_summary()}
+
+
+async def _reminder_loop():
+    """Background loop: every 60s, check for tasks due within the next 5 minutes.
+
+    Fires a macOS notification and pushes a WebSocket message for each due task.
+    Each task is only notified once per server session.
+    """
+    await asyncio.sleep(10)  # let the server finish starting
+    while True:
+        try:
+            due = get_due_soon(minutes=5)
+            for t in due:
+                tid = t["id"]
+                if tid in _reminder_fired:
+                    continue
+                _reminder_fired.add(tid)
+                title = t.get("title", "Untitled task")
+                due_time = t.get("due_time", "")
+                log.info(f"Reminder firing: [{tid}] {title} at {due_time}")
+                # macOS notification (fires even if browser is hidden)
+                try:
+                    await asyncio.create_subprocess_exec(
+                        "osascript", "-e",
+                        f'display notification "{title}" with title "JARVIS Reminder" '
+                        f'subtitle "Due at {due_time}" sound name "Glass"',
+                    )
+                except Exception:
+                    pass
+                # Push to WebSocket clients
+                reminder_msg = {
+                    "type": "reminder",
+                    "task_id": tid,
+                    "title": title,
+                    "due_time": due_time,
+                }
+                await task_manager._notify(reminder_msg)
+        except Exception as e:
+            log.warning(f"Reminder loop error: {e}")
+        await asyncio.sleep(60)
+
+
+def _recall_memories(topic: str) -> str:
+    """Search saved memories for a topic and format for voice."""
+    results = recall(topic, limit=5)
+    if not results:
+        return f"I don't have anything saved about {topic}, sir."
+    parts = [f"Here's what I know about {topic}."]
+    for m in results[:5]:
+        parts.append(m.get("content", ""))
+    return " ".join(parts)
+
+
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
@@ -1872,6 +1962,23 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's the cost", "whats the cost", "api cost", "token usage",
                              "how expensive", "what's my bill"]):
         return {"action": "check_usage"}
+
+    # Inbox summary — spoken digest of unread grouped by sender
+    if any(p in t for p in ["summarize my inbox", "summarise my inbox", "inbox summary",
+                             "sum up my email", "sum up my mail", "what emails do i have",
+                             "who emailed me", "who's emailed me", "whos emailed me",
+                             "email summary", "mail summary", "digest my inbox",
+                             "digest my email", "whats in my email", "what's in my email"]):
+        return {"action": "inbox_summary"}
+
+    # Memory recall — search stored facts about a topic
+    if re.match(r"what do you (know|remember) about ", t):
+        topic = re.sub(r"what do you (know|remember) about ", "", t).strip().rstrip("?")
+        return {"action": "memory_recall", "topic": topic}
+    if re.match(r"(recall|remember) .+", t) and "remember that" not in t and "remember this" not in t:
+        topic = re.sub(r"^(recall|remember) ", "", t).strip().rstrip("?")
+        if topic and len(topic) > 2:
+            return {"action": "memory_recall", "topic": topic}
 
     return None  # Everything else goes to the LLM for conversational routing
 
@@ -2507,6 +2614,10 @@ async def voice_handler(ws: WebSocket):
                             response_text = format_tasks_for_voice(tasks)
                         elif action["action"] == "check_usage":
                             response_text = get_usage_summary()
+                        elif action["action"] == "inbox_summary":
+                            response_text = await _compose_inbox_summary()
+                        elif action["action"] == "memory_recall":
+                            response_text = _recall_memories(action.get("topic", ""))
                         else:
                             response_text = "Understood, sir."
                     else:

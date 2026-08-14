@@ -77,6 +77,9 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")
 LLM_FAST_MODEL = os.getenv("LLM_FAST_MODEL", "")
 LLM_DEEP_MODEL = os.getenv("LLM_DEEP_MODEL", "")
 LLM_VISION = os.getenv("LLM_VISION", "true").lower() not in ("0", "false", "no")
+# Comma-separated models to fall back to when the primary is rate-limited
+# (each has its own free-tier daily quota, so this multiplies daily capacity).
+LLM_FALLBACK_MODELS = [m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()]
 
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
@@ -1522,6 +1525,7 @@ async def lifespan(application: FastAPI):
         fast_model=LLM_FAST_MODEL,
         deep_model=LLM_DEEP_MODEL,
         supports_vision=LLM_VISION,
+        fallback_models=LLM_FALLBACK_MODELS,
     )
     cached_projects = []
 
@@ -2691,6 +2695,7 @@ async def api_test_anthropic(body: KeyTest):
             fast_model=LLM_FAST_MODEL,
             deep_model=LLM_DEEP_MODEL,
             supports_vision=LLM_VISION,
+            fallback_models=LLM_FALLBACK_MODELS,
         )
         if client is None:
             return {"valid": False, "error": "Could not build LLM client"}

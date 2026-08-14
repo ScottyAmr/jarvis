@@ -149,7 +149,7 @@ export function initDashboard() {
   tickClock();
   setInterval(tickClock, 1000);
   refresh();
-  setInterval(refresh, 15000);
+  setInterval(refresh, 30000);
 
   const dash = $("dashboard");
   const open = () => { dash?.classList.remove("dash-hidden"); refresh(); };

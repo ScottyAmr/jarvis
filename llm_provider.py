@@ -370,17 +370,6 @@ class _CompatMessages:
                 "without vision support (set LLM_VISION=true to allow)"
             )
 
-        payload: dict[str, Any] = {
-            "model": target,
-            "messages": chat,
-            "max_tokens": max_tokens,
-        }
-        if _is_reasoning_model(target):
-            payload["max_tokens"] = max_tokens + REASONING_HEADROOM
-            payload["reasoning_effort"] = "low"
-        if temperature is not None:
-            payload["temperature"] = temperature
-
         headers = {"Content-Type": "application/json"}
         if c.api_key:
             headers["Authorization"] = f"Bearer {c.api_key}"
@@ -388,28 +377,67 @@ class _CompatMessages:
             headers["HTTP-Referer"] = "http://localhost:5173"
             headers["X-Title"] = "JARVIS"
 
+        # Try the primary model, then each fallback. Each model has its own
+        # daily/minute quota, so a fallback recovers a rate-limited primary.
+        models_to_try = [target]
+        for fb in c.fallback_models:
+            if fb and fb not in models_to_try:
+                models_to_try.append(fb)
+
+        resp = None
+        used_model = target
+        last_err = "no response"
+        rate_limited = False
         async with httpx.AsyncClient(timeout=c.timeout) as http:
-            attempt = 0
-            while True:
-                resp = await http.post(
-                    f"{c.base_url}/chat/completions", json=payload, headers=headers
-                )
-                if resp.status_code != 429 or attempt >= RATE_LIMIT_MAX_RETRIES:
+            for mi, mdl in enumerate(models_to_try):
+                payload: dict[str, Any] = {"model": mdl, "messages": chat, "max_tokens": max_tokens}
+                if _is_reasoning_model(mdl):
+                    payload["max_tokens"] = max_tokens + REASONING_HEADROOM
+                    payload["reasoning_effort"] = "low"
+                if temperature is not None:
+                    payload["temperature"] = temperature
+
+                attempt = 0
+                while True:
+                    resp = await http.post(
+                        f"{c.base_url}/chat/completions", json=payload, headers=headers
+                    )
+                    if resp.status_code != 429:
+                        break
+                    # A per-DAY cap won't clear in seconds — skip retries, fall back.
+                    body = resp.text.lower()
+                    daily = "per day" in body or "tpd" in body
+                    if daily or attempt >= RATE_LIMIT_MAX_RETRIES:
+                        break
+                    wait = min(_retry_after_seconds(resp) + 0.25, RATE_LIMIT_MAX_WAIT)
+                    attempt += 1
+                    log.warning(
+                        f"{c.provider} rate-limited (429) on {mdl}; waiting "
+                        f"{wait:.1f}s and retrying ({attempt}/{RATE_LIMIT_MAX_RETRIES})"
+                    )
+                    await asyncio.sleep(wait)
+
+                if resp.status_code == 200:
+                    used_model = mdl
                     break
-                wait = min(_retry_after_seconds(resp) + 0.25, RATE_LIMIT_MAX_WAIT)
-                attempt += 1
-                log.warning(
-                    f"{c.provider} rate-limited (429); waiting {wait:.1f}s and "
-                    f"retrying ({attempt}/{RATE_LIMIT_MAX_RETRIES})"
+                last_err = f"{resp.status_code} on '{mdl}': {resp.text[:180]}"
+                if resp.status_code == 429:
+                    rate_limited = True
+                    if mi < len(models_to_try) - 1:
+                        log.warning(f"{c.provider}: {mdl} rate-limited — falling back to {models_to_try[mi + 1]}")
+                        continue
+                break  # non-429 error, or no models left
+
+        if resp is None or resp.status_code != 200:
+            if rate_limited:
+                raise RuntimeError(
+                    f"{c.provider} rate limit exhausted across all models "
+                    f"({', '.join(models_to_try)}) — daily free-tier quota reached. "
+                    f"Last: {last_err}"
                 )
-                await asyncio.sleep(wait)
+            raise RuntimeError(f"{c.provider} API error {last_err}")
 
-        if resp.status_code != 200:
-            raise RuntimeError(
-                f"{c.provider} API error {resp.status_code} on model "
-                f"'{target}': {resp.text[:300]}"
-            )
-
+        target = used_model  # for the empty-content diagnostics below
         data = resp.json()
         choices = data.get("choices") or []
         text = ""
@@ -451,6 +479,7 @@ class AsyncOpenAICompat:
         fast_model: str = "",
         deep_model: str = "",
         supports_vision: bool = True,
+        fallback_models: Optional[list] = None,
         timeout: float = 120.0,
     ):
         self.provider = provider
@@ -459,6 +488,7 @@ class AsyncOpenAICompat:
         self.fast_model = fast_model
         self.deep_model = deep_model or fast_model
         self.supports_vision = supports_vision
+        self.fallback_models = fallback_models or []
         self.timeout = timeout
         self.messages = _CompatMessages(self)
         if not self.base_url:
@@ -495,7 +525,7 @@ def build_client(provider: str, *, anthropic_key: str = "", gemini_key: str = ""
                  gemini_deep: str = "gemini-2.0-flash",
                  llm_key: str = "", base_url: str = "",
                  fast_model: str = "", deep_model: str = "",
-                 supports_vision: bool = True):
+                 supports_vision: bool = True, fallback_models: Optional[list] = None):
     """Return an Anthropic-shaped client for the configured provider.
 
     Supported: "anthropic", "gemini", and any OpenAI-compatible endpoint
@@ -526,14 +556,15 @@ def build_client(provider: str, *, anthropic_key: str = "", gemini_key: str = ""
             client = AsyncOpenAICompat(
                 provider, api_key=llm_key, base_url=base_url,
                 fast_model=fast_model, deep_model=deep_model,
-                supports_vision=supports_vision,
+                supports_vision=supports_vision, fallback_models=fallback_models,
             )
         except ValueError as e:
             log.warning(f"LLM provider misconfigured: {e}")
             return None
         log.info(
             f"LLM provider: {provider} @ {client.base_url} "
-            f"(fast={client.fast_model}, deep={client.deep_model}, vision={supports_vision})"
+            f"(fast={client.fast_model}, deep={client.deep_model}, "
+            f"fallbacks={client.fallback_models or 'none'}, vision={supports_vision})"
         )
         return client
 

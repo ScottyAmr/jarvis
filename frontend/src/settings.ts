@@ -153,6 +153,64 @@ function buildPanelHTML(): string {
           </div>
         </section>
 
+        <!-- Voice & Locale -->
+        <section class="settings-section" id="section-voice-locale">
+          <h3>Voice & Locale</h3>
+
+          <div class="settings-field">
+            <label>Voice Engine</label>
+            <select id="input-voice-engine">
+              <option value="piper">Piper (local, free)</option>
+              <option value="say">macOS Say (local, free)</option>
+              <option value="fish">Fish Audio (cloud, paid)</option>
+            </select>
+          </div>
+
+          <div class="settings-field" id="field-say-voice" style="display:none">
+            <label>macOS Voice</label>
+            <select id="input-say-voice">
+              <option value="Daniel">Daniel</option>
+            </select>
+          </div>
+
+          <div class="settings-field">
+            <label>Language</label>
+            <select id="input-language">
+              <option value="en">English</option>
+              <option value="es">Español</option>
+              <option value="fr">Français</option>
+              <option value="de">Deutsch</option>
+              <option value="it">Italiano</option>
+              <option value="pt">Português</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+              <option value="zh">中文</option>
+              <option value="ar">العربية</option>
+              <option value="hi">हिन्दी</option>
+            </select>
+          </div>
+
+          <div class="settings-field">
+            <label>Temperature Unit</label>
+            <select id="input-temp-unit">
+              <option value="celsius">Celsius</option>
+              <option value="fahrenheit">Fahrenheit</option>
+            </select>
+          </div>
+
+          <div class="settings-field">
+            <label>Time Format</label>
+            <select id="input-time-format">
+              <option value="12h">12-hour</option>
+              <option value="24h">24-hour</option>
+            </select>
+          </div>
+
+          <div class="settings-actions">
+            <button class="settings-btn primary" id="btn-save-voice-locale">Save Voice & Locale</button>
+          </div>
+        </section>
+
         <!-- System Info -->
         <section class="settings-section" id="section-sysinfo">
           <h3>System Info</h3>
@@ -250,6 +308,43 @@ async function loadPreferences() {
   }
 }
 
+async function loadVoiceLocale() {
+  try {
+    const voice = await apiGet<{
+      current_engine: string;
+      current_say_voice: string;
+      mac_voices: string[];
+    }>("/api/settings/voice");
+    const locale = await apiGet<{
+      language: string;
+      temperature_unit: string;
+      time_format: string;
+    }>("/api/settings/locale");
+
+    const engineEl = document.getElementById("input-voice-engine") as HTMLSelectElement;
+    if (engineEl) engineEl.value = voice.current_engine || "piper";
+
+    // Populate macOS voices dropdown
+    const sayVoiceEl = document.getElementById("input-say-voice") as HTMLSelectElement;
+    if (sayVoiceEl && voice.mac_voices?.length) {
+      sayVoiceEl.innerHTML = voice.mac_voices
+        .map((v: string) => `<option value="${v}"${v === voice.current_say_voice ? " selected" : ""}>${v}</option>`)
+        .join("");
+    }
+    const sayField = document.getElementById("field-say-voice");
+    if (sayField) sayField.style.display = voice.current_engine === "say" ? "" : "none";
+
+    const langEl = document.getElementById("input-language") as HTMLSelectElement;
+    if (langEl) langEl.value = locale.language || "en";
+    const tempEl = document.getElementById("input-temp-unit") as HTMLSelectElement;
+    if (tempEl) tempEl.value = locale.temperature_unit || "celsius";
+    const timeEl = document.getElementById("input-time-format") as HTMLSelectElement;
+    if (timeEl) timeEl.value = locale.time_format || "12h";
+  } catch (e) {
+    console.error("[settings] failed to load voice/locale:", e);
+  }
+}
+
 function wireEvents() {
   // Close
   document.getElementById("settings-close")?.addEventListener("click", closeSettings);
@@ -310,6 +405,30 @@ function wireEvents() {
     await loadStatus();
   });
 
+  // Voice engine dropdown — show/hide macOS voice selector
+  const voiceEngineEl = document.getElementById("input-voice-engine") as HTMLSelectElement;
+  voiceEngineEl?.addEventListener("change", () => {
+    const sayField = document.getElementById("field-say-voice");
+    if (sayField) sayField.style.display = voiceEngineEl.value === "say" ? "" : "none";
+  });
+
+  // Save voice & locale
+  document.getElementById("btn-save-voice-locale")?.addEventListener("click", async () => {
+    const engine = (document.getElementById("input-voice-engine") as HTMLSelectElement).value;
+    const sayVoice = (document.getElementById("input-say-voice") as HTMLSelectElement).value;
+    const language = (document.getElementById("input-language") as HTMLSelectElement).value;
+    const tempUnit = (document.getElementById("input-temp-unit") as HTMLSelectElement).value;
+    const timeFormat = (document.getElementById("input-time-format") as HTMLSelectElement).value;
+
+    await apiPost("/api/settings/voice", { engine, say_voice: sayVoice });
+    await apiPost("/api/settings/locale", {
+      language,
+      temperature_unit: tempUnit,
+      time_format: timeFormat,
+    });
+    await loadStatus();
+  });
+
   // Setup next button
   document.getElementById("btn-setup-next")?.addEventListener("click", advanceSetup);
 }
@@ -364,7 +483,7 @@ async function advanceSetup() {
     if (nav) nav.style.display = "none";
 
     // Show all sections
-    ["section-api-keys", "section-status", "section-preferences", "section-sysinfo"].forEach((id) => {
+    ["section-api-keys", "section-status", "section-preferences", "section-voice-locale", "section-sysinfo"].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.style.display = "";
     });
@@ -398,6 +517,7 @@ export async function openSettings() {
   // Load data
   const status = await loadStatus();
   await loadPreferences();
+  await loadVoiceLocale();
 
   // Check for first-time setup
   if (status && !status.env_keys_set.anthropic) {

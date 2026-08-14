@@ -161,6 +161,8 @@ say "I built X", never "Claude Code did X".
 - [ACTION:REMEMBER] content — store a DURABLE fact/preference/decision about {user_name} (e.g. "prefers
   React", "based in Melbourne"). NEVER remember meta-commentary, test confirmations, greetings, or transient
   status ("memory works", "restarted"). If it won't matter next week, don't store it.
+- [ACTION:DRAFT_REPLY] subject-search — read the email matching that subject and draft a reply. The draft is
+  shown to {user_name} for review — NOTHING is sent. Stay in voice/character. Keep the draft concise and professional.
 - [ACTION:ADD_NOTE] topic ||| content   ·   [ACTION:CREATE_NOTE] title ||| body   ·   [ACTION:READ_NOTE] title-search
 
 ACTION RULES:
@@ -189,6 +191,7 @@ LIVE CONTEXT (refreshes every turn):
 TIME & WEATHER:
 - Current time: {current_time}
 - {weather_info}
+{locale_line}
 
 SCREEN AWARENESS:
 {screen_context}
@@ -806,7 +809,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     # "[Action:REMEMBER]" or "[ ACTION: REMEMBER ]"; parse those too so a
     # malformed tag is stripped from speech rather than spoken aloud.
     match = _action_re.search(
-        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN)\s*\]\s*(.*?)$',
+        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|DRAFT_REPLY)\s*\]\s*(.*?)$',
         response, _action_re.DOTALL | _action_re.IGNORECASE,
     )
     if match:
@@ -1349,9 +1352,17 @@ async def generate_response(
     )
 
     # Per-turn live context — small and always changing, so it stays uncached.
+    # Build locale line if non-English language is configured
+    lang = os.getenv("JARVIS_LANGUAGE", "en")
+    region = os.getenv("JARVIS_REGION", "")
+    locale_line = ""
+    if lang and lang != "en":
+        locale_line = f"LANGUAGE: Respond in {lang}" + (f" ({region})" if region else "") + ". Keep your JARVIS persona."
+
     dynamic_system = JARVIS_DYNAMIC_CONTEXT.format(
         current_time=current_time,
         weather_info=weather_info,
+        locale_line=locale_line,
         screen_context=screen_ctx or "Not checked yet.",
         calendar_context=calendar_ctx,
         mail_context=mail_ctx,
@@ -1864,6 +1875,49 @@ async def _reminder_loop():
         await asyncio.sleep(60)
 
 
+async def _draft_reply_and_report(subject_search: str, ws, history: list[dict], voice_state: dict):
+    """Read an email, draft a reply via the LLM, and speak the result.
+
+    NOTHING is sent — the draft is presented to the user for review only.
+    """
+    try:
+        email = await read_message(subject_search)
+        if not email:
+            msg = f"Couldn't find an email matching '{subject_search}', sir."
+        else:
+            sender = email["sender"].split("<")[0].strip().strip('"')
+            draft_prompt = (
+                f"Draft a brief, professional reply to this email.\n\n"
+                f"From: {email['sender']}\n"
+                f"Subject: {email['subject']}\n"
+                f"Date: {email['date']}\n\n"
+                f"{email['content'][:2000]}\n\n"
+                f"Write ONLY the reply body. Keep it concise. Sign off as {USER_NAME}."
+            )
+            if anthropic_client:
+                resp = await anthropic_client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=300,
+                    messages=[{"role": "user", "content": draft_prompt}],
+                )
+                draft_text = resp.content[0].text if resp.content else ""
+            else:
+                draft_text = "(LLM unavailable — can't generate draft right now.)"
+
+            msg = f"Here's a draft reply to {sender}. Re: {email['subject']}. {draft_text}"
+            log.info(f"Draft reply composed for: {email['subject']}")
+
+        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+        if audio and ws:
+            try:
+                await ws.send_json({"type": "status", "state": "speaking"})
+                await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+            except Exception:
+                pass
+    except Exception as e:
+        log.error(f"Draft reply failed: {e}")
+
+
 def _recall_memories(topic: str) -> str:
     """Search saved memories for a topic and format for voice."""
     results = recall(topic, limit=5)
@@ -1962,6 +2016,22 @@ def detect_action_fast(text: str) -> dict | None:
                              "what's the cost", "whats the cost", "api cost", "token usage",
                              "how expensive", "what's my bill"]):
         return {"action": "check_usage"}
+
+    # Voice switching — "switch to piper", "change voice to daniel"
+    voice_match = re.match(r"(?:switch|change)\s+(?:to|voice\s+to|voice\s+engine\s+to)\s+(.+)", t)
+    if voice_match:
+        target = voice_match.group(1).strip()
+        if target in ("piper", "say", "fish", "fish audio"):
+            engine = "fish" if "fish" in target else target
+            return {"action": "switch_voice", "engine": engine}
+        else:
+            return {"action": "switch_voice", "say_voice": target}
+
+    # Draft reply — read an email and compose a reply
+    draft_match = re.match(r"(?:draft|write|compose)\s+(?:a\s+)?repl(?:y|ies?)\s+(?:to\s+)?(.+)", t)
+    if draft_match:
+        subject = draft_match.group(1).strip()
+        return {"action": "draft_reply", "subject": subject}
 
     # Inbox summary — spoken digest of unread grouped by sender
     if any(p in t for p in ["summarize my inbox", "summarise my inbox", "inbox summary",
@@ -2341,6 +2411,7 @@ async def voice_handler(ws: WebSocket):
         {"type": "task_spawned", "task_id": "...", "prompt": "..."}
         {"type": "task_complete", "task_id": "...", "summary": "..."}
     """
+    global VOICE_ENGINE, SAY_VOICE
     await ws.accept()
     task_manager.register_websocket(ws)
     history: list[dict] = []
@@ -2618,6 +2689,22 @@ async def voice_handler(ws: WebSocket):
                             response_text = await _compose_inbox_summary()
                         elif action["action"] == "memory_recall":
                             response_text = _recall_memories(action.get("topic", ""))
+                        elif action["action"] == "draft_reply":
+                            response_text = "Reading that email now, sir."
+                            asyncio.create_task(_draft_reply_and_report(action.get("subject", ""), ws, history, voice_state))
+                        elif action["action"] == "switch_voice":
+                            engine = action.get("engine", "")
+                            say_voice = action.get("say_voice", "")
+                            if engine:
+                                _write_env_key("VOICE_ENGINE", engine)
+                                VOICE_ENGINE = engine
+                                response_text = f"Voice engine switched to {engine}, sir."
+                            elif say_voice:
+                                _write_env_key("SAY_VOICE", say_voice)
+                                _write_env_key("VOICE_ENGINE", "say")
+                                VOICE_ENGINE = "say"
+                                SAY_VOICE = say_voice
+                                response_text = f"Voice switched to {say_voice}, sir."
                         else:
                             response_text = "Understood, sir."
                     else:
@@ -2762,6 +2849,8 @@ async def voice_handler(ws: WebSocket):
                                             except Exception:
                                                 pass
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
+                                elif embedded_action["action"] == "draft_reply":
+                                    asyncio.create_task(_draft_reply_and_report(embedded_action["target"].strip(), ws, history, voice_state))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})
@@ -3041,6 +3130,86 @@ async def api_save_preferences(body: PreferencesUpdate):
     _write_env_key("HONORIFIC", body.honorific)
     _write_env_key("CALENDAR_ACCOUNTS", body.calendar_accounts)
     return {"success": True}
+
+
+class LocaleUpdate(BaseModel):
+    language: str = "en"  # ISO 639-1 code
+    region: str = ""  # e.g. "AU", "US", "GB"
+    temperature_unit: str = ""  # "celsius" or "fahrenheit"
+    time_format: str = ""  # "12h" or "24h"
+    date_format: str = ""  # "DD/MM/YYYY" or "MM/DD/YYYY"
+
+
+@app.get("/api/settings/locale")
+async def api_get_locale():
+    _, env_dict = _read_env()
+    return {
+        "language": env_dict.get("JARVIS_LANGUAGE", "en"),
+        "region": env_dict.get("JARVIS_REGION", ""),
+        "temperature_unit": env_dict.get("WEATHER_UNIT", "fahrenheit"),
+        "time_format": env_dict.get("JARVIS_TIME_FORMAT", "12h"),
+        "date_format": env_dict.get("JARVIS_DATE_FORMAT", "DD/MM/YYYY"),
+    }
+
+
+@app.post("/api/settings/locale")
+async def api_set_locale(body: LocaleUpdate):
+    if body.language:
+        _write_env_key("JARVIS_LANGUAGE", body.language)
+    if body.region:
+        _write_env_key("JARVIS_REGION", body.region)
+    if body.temperature_unit:
+        _write_env_key("WEATHER_UNIT", body.temperature_unit)
+    if body.time_format:
+        _write_env_key("JARVIS_TIME_FORMAT", body.time_format)
+    if body.date_format:
+        _write_env_key("JARVIS_DATE_FORMAT", body.date_format)
+    return {"success": True}
+
+
+class VoiceUpdate(BaseModel):
+    engine: str = ""  # "piper", "say", "fish"
+    say_voice: str = ""  # macOS voice name (e.g. "Daniel", "Samantha")
+
+
+@app.get("/api/settings/voice")
+async def api_get_voice():
+    _, env_dict = _read_env()
+    available_engines = ["piper", "say"]
+    if _env_set(env_dict, "FISH_API_KEY"):
+        available_engines.append("fish")
+    # List macOS voices
+    mac_voices = []
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", "?",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        for line in stdout.decode().splitlines():
+            parts = line.strip().split()
+            if parts:
+                mac_voices.append(parts[0])
+    except Exception:
+        mac_voices = ["Daniel", "Samantha", "Alex", "Karen", "Moira"]
+    return {
+        "current_engine": VOICE_ENGINE,
+        "current_say_voice": SAY_VOICE,
+        "available_engines": available_engines,
+        "mac_voices": mac_voices[:30],
+    }
+
+
+@app.post("/api/settings/voice")
+async def api_set_voice(body: VoiceUpdate):
+    global VOICE_ENGINE, SAY_VOICE
+    if body.engine and body.engine in ("piper", "say", "fish"):
+        _write_env_key("VOICE_ENGINE", body.engine)
+        VOICE_ENGINE = body.engine
+    if body.say_voice:
+        _write_env_key("SAY_VOICE", body.say_voice)
+        SAY_VOICE = body.say_voice
+    return {"success": True, "engine": VOICE_ENGINE, "say_voice": SAY_VOICE}
 
 # ---------------------------------------------------------------------------
 # Control endpoints (restart, fix-self)

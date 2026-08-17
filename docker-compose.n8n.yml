@@ -1,0 +1,26 @@
+# Standalone n8n instance for local development.
+#
+# This does NOT touch how Jarvis itself runs — Jarvis stays a native local
+# process (its AppleScript integrations need the host Mac), this just gives
+# it something to talk to. Start with:
+#
+#   docker compose -f docker-compose.n8n.yml up -d
+#
+# Then open http://localhost:5678, create an owner account, import
+# integrations/n8n/workflows/ping_test.json, and activate it. See
+# integrations/n8n/README.md for the full walkthrough.
+
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: jarvis-n8n
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:

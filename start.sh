@@ -48,11 +48,21 @@ cleanup() {
 trap cleanup INT TERM
 
 # --- start both servers ------------------------------------------------------
-echo "Starting backend  (port $BACKEND_PORT)..."
-./.venv/bin/python server.py --reload 2>&1 | sed 's/^/[backend]  /' &
+start_backend() {
+  # Clear any lingering process on the port (e.g. a reload-watcher subprocess
+  # left behind by a SIGKILL) before relaunching — avoids "Address already in use".
+  lsof -ti:"$BACKEND_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
+  sleep 1
+  echo "Starting backend  (port $BACKEND_PORT)..."
+  ./.venv/bin/python server.py --reload 2>&1 | sed 's/^/[backend]  /' &
+}
+start_frontend() {
+  echo "Starting frontend (port $FRONTEND_PORT)..."
+  ( cd frontend && npm run dev ) 2>&1 | sed 's/^/[frontend] /' &
+}
 
-echo "Starting frontend (port $FRONTEND_PORT)..."
-( cd frontend && npm run dev ) 2>&1 | sed 's/^/[frontend] /' &
+start_backend
+start_frontend
 
 echo ""
 echo "======================================================"
@@ -76,13 +86,51 @@ if lsof -ti:"$FRONTEND_PORT" >/dev/null 2>&1; then
     || open "http://localhost:$FRONTEND_PORT" 2>/dev/null || true
 fi
 
-# Watch both ports; if either server stops listening, tear the other down too.
+# Watch both ports; if either dies, restart just that one (the frontend
+# already reconnects its WebSocket with backoff once the backend comes back
+# — see frontend/src/ws.ts — so a backend blip no longer needs to take the
+# whole stack down). Capped at 5 restarts per service within a 10-minute
+# window so a genuinely broken start (crashes immediately every time)
+# reports itself instead of spinning forever.
+BACKEND_RESTARTS=0
+FRONTEND_RESTARTS=0
+WINDOW_START=$(date +%s)
+RESTART_CAP=5
+RESTART_WINDOW_SECONDS=600
+
+maybe_reset_window() {
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$(( now - WINDOW_START ))
+  if [ "$elapsed" -gt "$RESTART_WINDOW_SECONDS" ]; then
+    WINDOW_START=$now
+    BACKEND_RESTARTS=0
+    FRONTEND_RESTARTS=0
+  fi
+}
+
 while true; do
   sleep 2
+  maybe_reset_window
+
   if ! lsof -ti:"$BACKEND_PORT" >/dev/null 2>&1; then
-    echo "[launcher] backend stopped."; cleanup
+    if [ "$BACKEND_RESTARTS" -ge "$RESTART_CAP" ]; then
+      echo "[launcher] backend died $RESTART_CAP times in ${RESTART_WINDOW_SECONDS}s — giving up on auto-restart."
+      echo "[launcher] check data/jarvis.log for the actual error, fix it, then re-run ./start.sh."
+      cleanup
+    fi
+    BACKEND_RESTARTS=$((BACKEND_RESTARTS + 1))
+    echo "[launcher] backend stopped (restart $BACKEND_RESTARTS/$RESTART_CAP) — restarting it..."
+    start_backend
   fi
+
   if ! lsof -ti:"$FRONTEND_PORT" >/dev/null 2>&1; then
-    echo "[launcher] frontend stopped."; cleanup
+    if [ "$FRONTEND_RESTARTS" -ge "$RESTART_CAP" ]; then
+      echo "[launcher] frontend died $RESTART_CAP times in ${RESTART_WINDOW_SECONDS}s — giving up on auto-restart."
+      cleanup
+    fi
+    FRONTEND_RESTARTS=$((FRONTEND_RESTARTS + 1))
+    echo "[launcher] frontend stopped (restart $FRONTEND_RESTARTS/$RESTART_CAP) — restarting it..."
+    start_frontend
   fi
 done

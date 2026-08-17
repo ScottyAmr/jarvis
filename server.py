@@ -13,6 +13,7 @@ import base64
 import hmac
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import sys
@@ -66,7 +67,25 @@ import write_integrations
 import file_organizer
 from integrations.n8n import get_client as get_n8n_client, get_workflow as get_n8n_workflow, describe_workflows_for_prompt as describe_n8n_workflows
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+# Console output (as before) PLUS a rotating file, so a crash/freeze can
+# actually be diagnosed afterward instead of only existing in whatever
+# terminal happened to have it on screen at the time (previously logs had
+# zero persistence — the exact gap that made a real backend crash on
+# 2026-08-17 undiagnosable after the fact).
+_LOG_DIR = Path(__file__).parent / "data"
+_LOG_DIR.mkdir(exist_ok=True)
+_log_formatter = logging.Formatter("%(asctime)s [%(name)s] %(message)s")
+_log_file_handler = RotatingFileHandler(
+    _LOG_DIR / "jarvis.log", maxBytes=10_000_000, backupCount=5,
+)
+_log_file_handler.setFormatter(_log_formatter)
+_log_console_handler = logging.StreamHandler()
+_log_console_handler.setFormatter(_log_formatter)
+logging.basicConfig(
+    level=logging.INFO, handlers=[_log_console_handler, _log_file_handler], force=True,
+)  # force=True: basicConfig() is a silent no-op if the root logger already has
+  # handlers (e.g. from an earlier-imported library, or pytest's own capture) —
+  # without this, the file handler could silently never attach.
 log = logging.getLogger("jarvis")
 
 # ---------------------------------------------------------------------------
@@ -2111,6 +2130,23 @@ async def _recall_and_report(query: str, ws, current_session_id: str):
         await _speak(ws, "Couldn't search past conversations, sir.")
 
 
+def _rotate_history(history: list[dict], keep: int = 20) -> list[dict]:
+    """Trim `history` down to the last `keep` entries IN PLACE (mutating the
+    same list object — background tasks like _execute_prompt_project hold a
+    reference to this same list, so reassigning `history = ...` in the
+    caller would silently orphan their future appends onto an abandoned
+    list). Returns the entries that were rotated out, for summarization.
+
+    Bug this fixes: this used to only compute the rotated-out slice for the
+    summary call and never actually trimmed `history`, so it grew unbounded
+    for the entire life of a WebSocket connection."""
+    if len(history) <= keep:
+        return []
+    rotated = history[:-keep]
+    del history[:-keep]
+    return rotated
+
+
 def _resolve_n8n_confirmation(pending: dict | None, t_lower: str, now: float | None = None) -> str:
     """Resolve a pending CONFIRM-tier n8n action against the next utterance.
     Returns 'confirm' or 'decline' if this utterance is a yes/no reply to a
@@ -2849,8 +2885,7 @@ async def voice_handler(ws: WebSocket):
     # Self-awareness — track last spoken response to avoid repetition
     last_jarvis_response = ""
 
-    # Three-tier conversation memory
-    session_buffer: list[dict] = []  # ALL messages, never truncated
+    # Rolling conversation memory
     session_summary: str = ""  # Rolling summary of older conversation
     summary_update_pending: bool = False
     messages_since_last_summary: int = 0
@@ -3398,17 +3433,12 @@ async def voice_handler(ws: WebSocket):
                 except Exception as e:
                     log.warning(f"conversation_memory log_turn failed: {e}")
 
-                # Three-tier memory: also track in session buffer
-                session_buffer.append({"role": "user", "content": user_text})
-                session_buffer.append({"role": "assistant", "content": response_text})
-
                 # Check if rolling summary needs updating
                 messages_since_last_summary += 1
                 if messages_since_last_summary >= 5 and len(history) > 20 and not summary_update_pending:
                     summary_update_pending = True
                     messages_since_last_summary = 0
-                    # Get messages that are about to be rotated out
-                    rotated = history[:-20] if len(history) > 20 else []
+                    rotated = _rotate_history(history, keep=20)
                     if rotated and anthropic_client:
                         async def _do_summary():
                             nonlocal session_summary, summary_update_pending
@@ -3857,11 +3887,22 @@ if __name__ == "__main__":
     # reload_excludes to quiet the noise; that combination crashes inside
     # uvicorn's resolve_reload_patterns() (a real bug, reproduced directly),
     # so left unscoped — a crash risk isn't worth trading for less log noise.
-    uvicorn.run(
-        "server:app",
-        host=args.host,
-        port=args.port,
-        reload=args.reload,
-        log_level="info",
-        **ssl_kwargs,
-    )
+    try:
+        uvicorn.run(
+            "server:app",
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            log_level="info",
+            **ssl_kwargs,
+        )
+    except Exception:
+        # Without this, an unhandled exception that escapes uvicorn.run()
+        # (startup failure, a bug in an exception handler itself, etc.) just
+        # prints a traceback to whatever stderr happens to be attached —
+        # easily lost if start.sh's terminal isn't being watched. Log it to
+        # the persistent file too so a "why did it die" investigation has
+        # somewhere to actually look, then re-raise so the process still
+        # exits non-zero (start.sh's restart loop below detects that).
+        log.critical("Server process crashed with an unhandled exception", exc_info=True)
+        raise

@@ -13,6 +13,7 @@ log = logging.getLogger("jarvis.notes")
 
 async def _run_notes_script(script: str, timeout: float = 10) -> str:
     """Run an AppleScript against Notes.app."""
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "osascript", "-e", script,
@@ -25,11 +26,26 @@ async def _run_notes_script(script: str, timeout: float = 10) -> str:
             return ""
         return stdout.decode().strip()
     except asyncio.TimeoutError:
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
         log.warning("Notes script timed out")
         return ""
     except Exception as e:
         log.warning(f"Notes script error: {e}")
         return ""
+
+
+async def check_notes_access(timeout: float = 3) -> bool:
+    """Return whether Notes.app is reachable without scanning recent notes."""
+    raw = await _run_notes_script(
+        'tell application "Notes" to return count of notes',
+        timeout=timeout,
+    )
+    return raw != ""
 
 
 async def get_recent_notes(count: int = 10) -> list[dict]:

@@ -44,6 +44,41 @@ end tell
 '''
 
 
+async def _run_calendar_script(script: str, timeout: float = 5) -> str:
+    """Run a short AppleScript against Calendar.app and return output."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if proc.returncode != 0:
+            return ""
+        return stdout.decode().strip()
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        log.debug(f"Calendar script timed out after {timeout}s")
+        return ""
+    except Exception as e:
+        log.debug(f"Calendar script error: {e}")
+        return ""
+
+
+async def check_calendar_access(timeout: float = 3) -> bool:
+    """Return whether Calendar.app is reachable without refreshing event data."""
+    raw = await _run_calendar_script(
+        'tell application "Calendar" to return count of calendars',
+        timeout=timeout,
+    )
+    return raw != ""
+
+
 async def _ensure_calendar_running():
     """Launch Calendar.app if not already running."""
     global _calendar_launched
@@ -209,18 +244,12 @@ async def get_next_event() -> dict | None:
 async def get_calendar_names() -> list[str]:
     """Get list of all calendar names."""
     await _ensure_calendar_running()
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e",
-            'tell application "Calendar" to return name of every calendar',
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
-            return [c.strip() for c in stdout.decode().strip().split(",") if c.strip()]
-    except Exception:
-        pass
+    raw = await _run_calendar_script(
+        'tell application "Calendar" to return name of every calendar',
+        timeout=5,
+    )
+    if raw:
+        return [c.strip() for c in raw.split(",") if c.strip()]
     return []
 
 

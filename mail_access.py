@@ -116,6 +116,36 @@ end tell
     return [a.strip() for a in raw.split(",") if a.strip()]
 
 
+async def check_mail_access(timeout: float = 3) -> bool:
+    """Return whether Mail.app is reachable without running an expensive inbox scan."""
+    script = """
+tell application "Mail"
+    return count of accounts
+end tell
+"""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode == 0
+    except asyncio.TimeoutError:
+        if proc:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        log.warning(f"Mail access probe timed out after {timeout}s")
+        return False
+    except Exception as e:
+        log.warning(f"Mail access probe failed: {e}")
+        return False
+
+
 async def get_unread_count() -> dict:
     """Get unread message count per account and total.
 

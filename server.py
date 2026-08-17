@@ -49,15 +49,15 @@ from pydantic import BaseModel
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
-from calendar_access import get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
-from mail_access import get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
+from calendar_access import check_calendar_access, get_todays_events, get_upcoming_events, get_next_event, format_events_for_context, format_schedule_summary, refresh_cache as refresh_calendar_cache
+from mail_access import check_mail_access, get_unread_count, get_unread_messages, get_recent_messages, search_mail, read_message, format_unread_summary, format_messages_for_context, format_messages_for_voice
 from memory import (
     remember, recall, get_open_tasks, create_task, complete_task, search_tasks,
     create_note, search_notes, get_tasks_for_date, build_memory_context,
     format_tasks_for_voice, extract_memories, is_memory_worthy, get_important_memories,
     get_due_soon,
 )
-from notes_access import get_recent_notes, read_note, search_notes_apple, create_apple_note
+from notes_access import check_notes_access, get_recent_notes, read_note, search_notes_apple, create_apple_note
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 from llm_provider import build_client as build_llm_client, LLMError
@@ -3687,13 +3687,18 @@ async def api_settings_status():
     import shutil as _shutil
     _, env_dict = _read_env()
     claude_installed = _shutil.which("claude") is not None
-    calendar_ok = mail_ok = notes_ok = False
-    try: await get_todays_events(); calendar_ok = True
-    except Exception: pass
-    try: await get_unread_count(); mail_ok = True
-    except Exception: pass
-    try: await get_recent_notes(count=1); notes_ok = True
-    except Exception: pass
+
+    async def _status_probe(awaitable):
+        try:
+            return bool(await awaitable)
+        except Exception:
+            return False
+
+    calendar_ok, mail_ok, notes_ok = await asyncio.gather(
+        _status_probe(check_calendar_access()),
+        _status_probe(check_mail_access()),
+        _status_probe(check_notes_access()),
+    )
     memory_count = task_count = 0
     try: memory_count = len(get_important_memories(limit=9999))
     except Exception: pass

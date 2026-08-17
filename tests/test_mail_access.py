@@ -98,3 +98,10 @@ def test_run_mail_script_timeout_kills_the_orphaned_process(monkeypatch):
 
     proc.kill.assert_called_once_with()
     proc.wait.assert_awaited_once()
+
+
+def test_check_mail_access_returns_false_on_failure(monkeypatch):
+    proc = make_mock_proc(returncode=1, stderr=b"not reachable")
+    asyncio.run(_patched_create_subprocess(monkeypatch, proc))
+
+    assert asyncio.run(mail_access.check_mail_access()) is False

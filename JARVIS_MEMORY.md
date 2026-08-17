@@ -416,8 +416,13 @@ split per-feature):
   Fixed by making `start.sh` choose HTTPS when certs exist and adding watchdog support for the
   local self-signed cert (`--insecure-tls`). Verified with `watchdog.py --once` against the
   live HTTPS `/api/health`.
-- Local full suite after the fix: 150 passing, 1 skipped. Pushed to `origin/main`; GitHub
-  Actions run 32010921989 (`Fix watchdog checks for local HTTPS`) completed successfully.
+- CI then caught a second real edge case: `_warn()` used `0.0` as the implicit previous
+  warning timestamp, so a process with monotonic uptime under 300 seconds suppressed its
+  first warning. Fixed to only apply cooldown after a warning has actually been logged, and
+  added a regression test that forces `now=1.0`.
+- Local full suite after the final fix: 151 passing, 1 skipped. Pushed to `origin/main`;
+  GitHub Actions run 32010921989 (`Fix watchdog checks for local HTTPS`) completed
+  successfully before the documentation-only run exposed the cooldown edge case.
 
 ### Still open
 - **If the self-improvement subsystem ever gets built for real**, treat it as its own scoped

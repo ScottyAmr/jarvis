@@ -164,8 +164,8 @@ class HealthMonitor:
             self._warn("memory", "health: RSS %sMB exceeds %dMB threshold", r["memory_rss_mb"], _MEMORY_WARN_MB, now=now)
 
     def _warn(self, key: str, message: str, *args: Any, now: float) -> None:
-        last = self._last_warning.get(key, 0.0)
-        if now - last < _WARNING_COOLDOWN:
+        last = self._last_warning.get(key)
+        if last is not None and now - last < _WARNING_COOLDOWN:
             return
         self._last_warning[key] = now
         log.warning(message, *args)

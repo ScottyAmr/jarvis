@@ -64,7 +64,7 @@ def test_warning_cooldown_prevents_log_spam(caplog):
     for _ in range(5):
         monitor.record_error()
 
-    now = time.monotonic()
+    now = 100.0
     with caplog.at_level(logging.WARNING, logger="jarvis.health"):
         monitor._check_thresholds(now)
         monitor._check_thresholds(now + 1)
@@ -72,3 +72,13 @@ def test_warning_cooldown_prevents_log_spam(caplog):
 
     warnings = [r for r in caplog.records if "errors in the last minute" in r.message]
     assert len(warnings) == 2
+
+
+def test_first_warning_is_not_suppressed_during_first_cooldown_window(caplog):
+    monitor = HealthMonitor()
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.health"):
+        monitor._warn("startup", "startup warning", now=1.0)
+
+    warnings = [r for r in caplog.records if "startup warning" in r.message]
+    assert len(warnings) == 1

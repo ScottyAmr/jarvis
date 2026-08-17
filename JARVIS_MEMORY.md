@@ -402,6 +402,23 @@ split per-feature):
 7. Remove conversation.py, superseded by planner.py's TaskPlanner
 (+ a small 8th commit fixing the CI Playwright gap above)
 
+### Resolved 2026-08-17, continued — watchdog and health checks
+- Added an internal `HealthMonitor` snapshot (`/api/health` plus spoken `health check`) with
+  uptime, active sessions, recent errors, latency, memory, machine-readable warnings, and
+  cooldown-gated warning logs so repeated degradation does not spam `data/jarvis.log`.
+- Added an external `watchdog.py` process and wired it into `start.sh`. It polls health from
+  outside the backend process, writes `data/watchdog.log`, records diagnostics on repeated
+  failures, asks `/api/restart` for a graceful restart when possible, and falls back to
+  terminating the backend port so the launcher can bring it back.
+- Live verification caught an important real-environment bug before leaving it for the user:
+  because this repo has `cert.pem`/`key.pem`, the running backend serves HTTPS, not plain HTTP.
+  The first watchdog version would have false-alarmed against `http://127.0.0.1:8340`.
+  Fixed by making `start.sh` choose HTTPS when certs exist and adding watchdog support for the
+  local self-signed cert (`--insecure-tls`). Verified with `watchdog.py --once` against the
+  live HTTPS `/api/health`.
+- Local full suite after the fix: 150 passing, 1 skipped. Pushed to `origin/main`; GitHub
+  Actions run 32010921989 (`Fix watchdog checks for local HTTPS`) completed successfully.
+
 ### Still open
 - **If the self-improvement subsystem ever gets built for real**, treat it as its own scoped
   project the way the n8n bridge was (plan mode, live testing) — not a quick reconnect. See

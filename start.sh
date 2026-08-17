@@ -13,6 +13,13 @@ cd "$ROOT"
 BACKEND_PORT=8340
 FRONTEND_PORT=5173
 WATCHDOG_PID=""
+BACKEND_SCHEME="http"
+WATCHDOG_TLS_ARGS=()
+
+if [ -f "$ROOT/cert.pem" ] && [ -f "$ROOT/key.pem" ]; then
+  BACKEND_SCHEME="https"
+  WATCHDOG_TLS_ARGS=(--insecure-tls)
+fi
 
 echo "JARVIS launcher — $ROOT"
 
@@ -67,8 +74,9 @@ start_frontend() {
 start_watchdog() {
   echo "Starting watchdog..."
   ./.venv/bin/python watchdog.py \
-    --health-url "http://127.0.0.1:$BACKEND_PORT/api/health" \
-    --restart-url "http://127.0.0.1:$BACKEND_PORT/api/restart" \
+    --health-url "$BACKEND_SCHEME://127.0.0.1:$BACKEND_PORT/api/health" \
+    --restart-url "$BACKEND_SCHEME://127.0.0.1:$BACKEND_PORT/api/restart" \
+    "${WATCHDOG_TLS_ARGS[@]}" \
     --port "$BACKEND_PORT" &
   WATCHDOG_PID=$!
 }

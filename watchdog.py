@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -43,9 +44,20 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, handlers=[console_handler, file_handler], force=True)
 
 
-def poll_health(url: str, timeout: float) -> tuple[bool, str, dict[str, Any]]:
+def _ssl_context(insecure_tls: bool) -> ssl.SSLContext | None:
+    if insecure_tls:
+        return ssl._create_unverified_context()
+    return None
+
+
+def poll_health(url: str, timeout: float, insecure_tls: bool = False) -> tuple[bool, str, dict[str, Any]]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        context = _ssl_context(insecure_tls)
+        if context:
+            resp_ctx = urllib.request.urlopen(url, timeout=timeout, context=context)
+        else:
+            resp_ctx = urllib.request.urlopen(url, timeout=timeout)
+        with resp_ctx as resp:
             body = resp.read().decode("utf-8", errors="replace")
             status_code = getattr(resp, "status", 200)
         if status_code < 200 or status_code >= 300:
@@ -107,10 +119,15 @@ def log_diagnostics(reason: str, port: int) -> None:
     log.warning("recent jarvis.log tail:\n%s", tail_file(JARVIS_LOG))
 
 
-def request_restart(url: str, timeout: float) -> bool:
+def request_restart(url: str, timeout: float, insecure_tls: bool = False) -> bool:
     req = urllib.request.Request(url, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        context = _ssl_context(insecure_tls)
+        if context:
+            resp_ctx = urllib.request.urlopen(req, timeout=timeout, context=context)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=timeout)
+        with resp_ctx as resp:
             return 200 <= getattr(resp, "status", 200) < 300
     except Exception as e:
         log.info("graceful restart request failed: %s", e)
@@ -184,7 +201,7 @@ class RestartLimiter:
 def recover(args: argparse.Namespace, reason: str) -> None:
     log_diagnostics(reason, args.port)
 
-    if request_restart(args.restart_url, args.timeout):
+    if request_restart(args.restart_url, args.timeout, args.insecure_tls):
         log.warning("requested graceful restart via %s", args.restart_url)
         return
 
@@ -208,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-restarts", type=int, default=3)
     parser.add_argument("--restart-window", type=int, default=600)
     parser.add_argument("--restart-command", default="")
+    parser.add_argument("--insecure-tls", action="store_true", help="Trust local self-signed HTTPS certs")
     parser.add_argument("--once", action="store_true", help="Poll once and exit without recovery")
     return parser
 
@@ -222,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("watchdog started for %s", args.health_url)
 
     while True:
-        ok, reason, payload = poll_health(args.health_url, args.timeout)
+        ok, reason, payload = poll_health(args.health_url, args.timeout, args.insecure_tls)
         if ok:
             failures = 0
             health = payload.get("health", {})

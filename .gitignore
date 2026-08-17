@@ -23,6 +23,7 @@ data/*.jsonl
 data/active_session.json
 data/.jarvis_output.txt
 data/jarvis.log*
+data/watchdog.log*
 
 # Certificates
 *.pem

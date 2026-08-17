@@ -34,6 +34,21 @@ def test_poll_health_accepts_online_payload(monkeypatch):
     assert payload["status"] == "online"
 
 
+def test_poll_health_can_use_insecure_tls_context(monkeypatch):
+    calls = []
+
+    def fake_urlopen(url, timeout, context=None):
+        calls.append(context)
+        return FakeResponse(b'{"status":"online","health":{"ok":true}}')
+
+    monkeypatch.setattr(watchdog.urllib.request, "urlopen", fake_urlopen)
+
+    ok, _, _ = watchdog.poll_health("https://test/health", timeout=1, insecure_tls=True)
+
+    assert ok is True
+    assert calls[0] is not None
+
+
 def test_poll_health_rejects_bad_status(monkeypatch):
     monkeypatch.setattr(
         watchdog.urllib.request,
@@ -82,9 +97,10 @@ def test_recover_prefers_graceful_restart(monkeypatch):
         timeout=1,
         grace_seconds=1,
         restart_command="",
+        insecure_tls=False,
     )
     monkeypatch.setattr(watchdog, "log_diagnostics", lambda reason, port: calls.append("diagnostics"))
-    monkeypatch.setattr(watchdog, "request_restart", lambda url, timeout: True)
+    monkeypatch.setattr(watchdog, "request_restart", lambda url, timeout, insecure_tls=False: True)
     monkeypatch.setattr(watchdog, "terminate_backend", lambda port, grace_seconds: calls.append("terminate"))
     monkeypatch.setattr(watchdog, "start_backend", lambda command: calls.append("start"))
 

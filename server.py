@@ -65,6 +65,7 @@ import conversation_memory
 import music_control
 import write_integrations
 import file_organizer
+from health_monitor import monitor as health_monitor
 from integrations.n8n import get_client as get_n8n_client, get_workflow as get_n8n_workflow, describe_workflows_for_prompt as describe_n8n_workflows
 
 # Console output (as before) PLUS a rotating file, so a crash/freeze can
@@ -228,6 +229,8 @@ say "I built X", never "Claude Code did X".
   shopping list", "what's on my list", "check off eggs") is handled instantly without you — only use this tag
   for indirect phrasing where the shopping-list intent isn't explicit ("we're out of milk", "remind me we
   need bread"). "items" is a comma-separated list for add/check, empty for list.
+- [ACTION:HEALTH] — report JARVIS health: uptime, sessions, recent errors, latency, and memory. Cheap,
+  no LLM analysis. Use when asked "how are you running", "health check", "are you okay", or "system status".
 - [ACTION:RECALL] query — search past conversations across sessions (distinct from REMEMBER, which is
   durable facts). Use when {user_name} references something said in an earlier session you don't have in
   the current LIVE CONTEXT.
@@ -829,7 +832,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     # "[Action:REMEMBER]" or "[ ACTION: REMEMBER ]"; parse those too so a
     # malformed tag is stripped from speech rather than spoken aloud.
     match = _action_re.search(
-        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|DRAFT_REPLY|SEND_EMAIL|CREATE_EVENT|SEND_MESSAGE|MUSIC|RECALL|ORGANIZE|ORGANIZE_CONFIRM|SHOPPING|N8N)\s*\]\s*(.*?)$',
+        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|DRAFT_REPLY|SEND_EMAIL|CREATE_EVENT|SEND_MESSAGE|MUSIC|HEALTH|RECALL|ORGANIZE|ORGANIZE_CONFIRM|SHOPPING|N8N)\s*\]\s*(.*?)$',
         response, _action_re.DOTALL | _action_re.IGNORECASE,
     )
     if match:
@@ -1438,6 +1441,7 @@ async def generate_response(
         return response.content[0].text
     except Exception as e:
         kind = getattr(e, "kind", "unknown") if isinstance(e, LLMError) else "unknown"
+        health_monitor.record_error()
         log.error(f"LLM error [{kind}]: {e}")
         return _llm_error_response(kind)
 
@@ -1638,6 +1642,7 @@ async def lifespan(application: FastAPI):
 
     # Start context refresh in a separate thread (never touches event loop)
     _refresh_context_sync()
+    health_monitor.start()
     log.info("JARVIS server starting")
 
     # Background reminder loop (fires macOS notifications for due tasks)
@@ -1645,6 +1650,7 @@ async def lifespan(application: FastAPI):
 
     yield
 
+    health_monitor.stop()
     reminder_task.cancel()
 
 
@@ -1663,7 +1669,13 @@ app.add_middleware(
 
 @app.get("/api/health")
 async def health():
-    return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
+    snapshot = health_monitor.status()
+    return {
+        "status": "online" if snapshot["ok"] else "degraded",
+        "name": "JARVIS",
+        "version": "0.1.0",
+        "health": snapshot,
+    }
 
 
 @app.get("/api/n8n/health")
@@ -2409,6 +2421,12 @@ def detect_action_fast(text: str) -> dict | None:
                              "how expensive", "what's my bill"]):
         return {"action": "check_usage"}
 
+    # Health check — direct path, no LLM call.
+    if any(p in t for p in ["health check", "system health", "system status",
+                             "how are you running", "are you okay", "are you frozen",
+                             "diagnostics", "diagnostic check"]):
+        return {"action": "check_health"}
+
     # Voice switching — "switch to piper", "change voice to daniel"
     voice_match = re.match(r"(?:switch|change)\s+(?:to|voice\s+to|voice\s+engine\s+to)\s+(.+)", t)
     if voice_match:
@@ -2862,6 +2880,7 @@ async def voice_handler(ws: WebSocket):
     global VOICE_ENGINE, SAY_VOICE
     await ws.accept()
     task_manager.register_websocket(ws)
+    health_monitor.on_session_open()
     history: list[dict] = []
     session_id = uuid.uuid4().hex[:12]
     work_session = WorkSession()
@@ -2956,6 +2975,8 @@ async def voice_handler(ws: WebSocket):
             user_text = apply_speech_corrections(msg.get("text", "").strip())
             if not user_text:
                 continue
+            turn_started = time.monotonic()
+            health_monitor.record_activity()
 
             # Cancel any in-flight response
             _current_response_id += 1
@@ -3068,6 +3089,7 @@ async def voice_handler(ws: WebSocket):
                 elif any(w in t_lower for w in ["quit work mode", "exit work mode", "go back to chat", "regular mode", "stop working"]):
                     if work_session.active:
                         await work_session.stop()
+                        health_monitor.record_activity()
                         response_text = "Back to conversation mode, sir."
                     else:
                         response_text = "Already in conversation mode, sir."
@@ -3179,6 +3201,8 @@ async def voice_handler(ws: WebSocket):
                             response_text = format_tasks_for_voice(tasks)
                         elif action["action"] == "check_usage":
                             response_text = get_usage_summary()
+                        elif action["action"] == "check_health":
+                            response_text = health_monitor.format_voice_report()
                         elif action["action"] == "inbox_summary":
                             response_text = await _compose_inbox_summary()
                         elif action["action"] == "memory_recall":
@@ -3402,6 +3426,8 @@ async def voice_handler(ws: WebSocket):
                                     asyncio.create_task(_send_message_and_report(embedded_action["target"], ws))
                                 elif embedded_action["action"] == "music":
                                     asyncio.create_task(_music_action_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "health":
+                                    response_text = health_monitor.format_voice_report()
                                 elif embedded_action["action"] == "recall":
                                     asyncio.create_task(_recall_and_report(embedded_action["target"], ws, session_id))
                                 elif embedded_action["action"] == "organize":
@@ -3423,6 +3449,7 @@ async def voice_handler(ws: WebSocket):
                                         asyncio.create_task(_n8n_action_and_report(wf_id, wf_payload, ws))
 
                 # Update history
+                health_monitor.record_latency((time.monotonic() - turn_started) * 1000)
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": response_text})
 
@@ -3475,6 +3502,8 @@ async def voice_handler(ws: WebSocket):
                     last_jarvis_response = response_text
 
             except Exception as e:
+                health_monitor.record_error()
+                health_monitor.record_latency((time.monotonic() - turn_started) * 1000)
                 log.error(f"Error: {e}", exc_info=True)
                 try:
                     fallback = "Something went wrong, sir."
@@ -3495,9 +3524,11 @@ async def voice_handler(ws: WebSocket):
     except WebSocketDisconnect:
         log.info("Voice WebSocket disconnected")
     except Exception as e:
+        health_monitor.record_error()
         log.error(f"WebSocket error: {e}", exc_info=True)
     finally:
         task_manager.unregister_websocket(ws)
+        health_monitor.on_session_close()
 
 
 # ---------------------------------------------------------------------------

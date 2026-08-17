@@ -12,6 +12,7 @@ cd "$ROOT"
 
 BACKEND_PORT=8340
 FRONTEND_PORT=5173
+WATCHDOG_PID=""
 
 echo "JARVIS launcher — $ROOT"
 
@@ -41,6 +42,9 @@ cleanup() {
   DONE=1
   echo ""
   echo "Stopping JARVIS..."
+  if [ -n "${WATCHDOG_PID:-}" ]; then
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+  fi
   lsof -ti:"$BACKEND_PORT"  2>/dev/null | xargs kill 2>/dev/null || true
   lsof -ti:"$FRONTEND_PORT" 2>/dev/null | xargs kill 2>/dev/null || true
   exit 0
@@ -60,9 +64,18 @@ start_frontend() {
   echo "Starting frontend (port $FRONTEND_PORT)..."
   ( cd frontend && npm run dev ) 2>&1 | sed 's/^/[frontend] /' &
 }
+start_watchdog() {
+  echo "Starting watchdog..."
+  ./.venv/bin/python watchdog.py \
+    --health-url "http://127.0.0.1:$BACKEND_PORT/api/health" \
+    --restart-url "http://127.0.0.1:$BACKEND_PORT/api/restart" \
+    --port "$BACKEND_PORT" &
+  WATCHDOG_PID=$!
+}
 
 start_backend
 start_frontend
+start_watchdog
 
 echo ""
 echo "======================================================"

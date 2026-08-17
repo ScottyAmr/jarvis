@@ -23,6 +23,7 @@ _WINDOW = 60  # seconds
 _ERROR_RATE_WARN = 5      # errors per minute
 _LATENCY_WARN_MS = 8_000  # ms — warn if p95 exceeds this
 _MEMORY_WARN_MB = 500     # RSS warn threshold
+_WARNING_COOLDOWN = 300   # seconds between repeated warnings of same type
 
 
 class HealthMonitor:
@@ -36,17 +37,22 @@ class HealthMonitor:
         self._session_count: int = 0
         self._start_time: float = time.monotonic()
         self._task: asyncio.Task | None = None
+        self._last_warning: dict[str, float] = {}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
+        if self._task and not self._task.done():
+            return
         self._task = asyncio.create_task(self._loop(), name="health-monitor")
 
     def stop(self) -> None:
-        if self._task:
+        if self._task and not self._task.done():
             self._task.cancel()
+        self._task = None
 
     def record_error(self) -> None:
+        self._last_activity = time.monotonic()
         self._errors.append(time.monotonic())
 
     def record_latency(self, ms: float) -> None:
@@ -91,9 +97,25 @@ class HealthMonitor:
             "memory_rss_mb": round(rss_mb, 1),
         }
 
+    def status(self) -> dict[str, Any]:
+        """Return report plus machine-readable health state."""
+        r = self.report()
+        warnings = []
+        if r["errors_last_minute"] >= _ERROR_RATE_WARN:
+            warnings.append("error_rate")
+        if r["p95_latency_ms"] >= _LATENCY_WARN_MS:
+            warnings.append("latency")
+        if r["memory_rss_mb"] >= _MEMORY_WARN_MB:
+            warnings.append("memory")
+        return {
+            **r,
+            "ok": not warnings,
+            "warnings": warnings,
+        }
+
     def format_voice_report(self) -> str:
         """One or two sentences suitable for JARVIS to speak aloud."""
-        r = self.report()
+        r = self.status()
         parts = []
 
         if r["errors_last_minute"] >= _ERROR_RATE_WARN:
@@ -133,13 +155,20 @@ class HealthMonitor:
             self._latencies.popleft()
 
     def _check_thresholds(self, now: float) -> None:
-        r = self.report()
+        r = self.status()
         if r["errors_last_minute"] >= _ERROR_RATE_WARN:
-            log.warning("health: %d errors in the last minute", r["errors_last_minute"])
+            self._warn("error_rate", "health: %d errors in the last minute", r["errors_last_minute"], now=now)
         if r["p95_latency_ms"] >= _LATENCY_WARN_MS:
-            log.warning("health: p95 latency %dms exceeds %dms threshold", r["p95_latency_ms"], _LATENCY_WARN_MS)
+            self._warn("latency", "health: p95 latency %dms exceeds %dms threshold", r["p95_latency_ms"], _LATENCY_WARN_MS, now=now)
         if 0 <= r["memory_rss_mb"] >= _MEMORY_WARN_MB:
-            log.warning("health: RSS %sMB exceeds %dMB threshold", r["memory_rss_mb"], _MEMORY_WARN_MB)
+            self._warn("memory", "health: RSS %sMB exceeds %dMB threshold", r["memory_rss_mb"], _MEMORY_WARN_MB, now=now)
+
+    def _warn(self, key: str, message: str, *args: Any, now: float) -> None:
+        last = self._last_warning.get(key, 0.0)
+        if now - last < _WARNING_COOLDOWN:
+            return
+        self._last_warning[key] = now
+        log.warning(message, *args)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

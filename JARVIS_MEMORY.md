@@ -368,12 +368,41 @@ inventing new work blind:
 - **`conversation.py` deleted** — confirmed zero references anywhere first. Recoverable via
   `git show d7e0702:conversation.py` if that turns out to be wrong.
 
+### Resolved 2026-08-17, continued — pushed and CI verified green
+User said "do everything." Organized the 30 files of accumulated uncommitted work into 7
+logical commits by file scope (couldn't cleanly split server.py's interleaved feature diffs
+finer than that — see below) and pushed to `github.com/ScottyAmr/jarvis`. `aura_content/`
+(a separate content-generation side-project for a different business, 3.2MB including
+generated PNGs and `__pycache__`) was deliberately excluded — doesn't belong in this repo,
+flagged to the user rather than silently committed either way.
+
+`git push` over HTTPS failed (`could not read Username — Device not configured`, no
+interactive credential prompt available); found a working SSH key already configured and
+authenticated as `ScottyAmr`, switched `origin` to the SSH URL, pushed successfully.
+
+**First real CI run failed — a genuine gap in the workflow, not a code bug**: 7/132 tests
+failed, all `tests/test_browser_integration.py`'s Playwright-launching tests, all the same
+root cause — `playwright install` was never run in the workflow, so the browser package was
+present but its actual browser binary wasn't downloaded on the fresh runner (worked locally
+this whole session because it was already installed on this machine). Added a
+`playwright install chromium` step, pushed the fix, watched the next run go green
+(commit `227fdd0`, 38s). This is exactly why "added CI" alone isn't done until it's actually
+been watched pass once — untested config is still a guess.
+
+Commit structure (server.py's diff mixes many features too tightly to split further without
+risky manual hunk-splitting, so it — along with mail_access.py/browser.py/start.sh/docs,
+which are similarly shared across features — rides in one larger commit rather than being
+split per-feature):
+1. Add conversation memory, music control, and mail/calendar write integrations
+2. Add automated file organizer with scheduled daily scanning
+3. Add n8n workflow-automation bridge
+4. Add shopping list, mail reliability, and module-wiring test coverage
+5. Add branding assets and frontend favicon
+6. Wire in features, fix reliability bugs, refresh docs and dev tooling
+7. Remove conversation.py, superseded by planner.py's TaskPlanner
+(+ a small 8th commit fixing the CI Playwright gap above)
+
 ### Still open
-- **Push to the new fork (`github.com/ScottyAmr/jarvis`)?** Remote is configured
-  (`origin`→fork, `upstream`→`ethanplusai/jarvis`), CI/Dependabot are ready, but nothing's
-  been pushed — 30 files of uncommitted, unorganized multi-session work would go public the
-  moment that happens. Needs an explicit decision on committing (as one or several commits?)
-  before pushing, not something to assume.
 - **If the self-improvement subsystem ever gets built for real**, treat it as its own scoped
   project the way the n8n bridge was (plan mode, live testing) — not a quick reconnect. See
   the 2026-08-17 entry above for why it's more involved than it looks.

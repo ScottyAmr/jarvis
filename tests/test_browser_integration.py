@@ -161,14 +161,16 @@ async def test_browser_research(browser):
 
 
 def test_browse_action_keywords():
-    """Action keywords include browse-related terms."""
-    from server import ACTION_KEYWORDS
+    """Browsing is dispatched via an LLM-embedded [ACTION:BROWSE] tag, not a fast
+    keyword table (there is no browse entry in detect_action_fast) — verify the
+    tag itself parses correctly out of a model response."""
+    from server import extract_action
 
-    assert "browse" in ACTION_KEYWORDS
-    browse_keywords = ACTION_KEYWORDS["browse"]
-    assert "search for" in browse_keywords
-    assert "look up" in browse_keywords
-    assert "google" in browse_keywords
+    clean_text, action = extract_action("Here you go, sir. [ACTION:BROWSE] search for python fastapi tutorial")
+    assert action is not None
+    assert action["action"] == "browse"
+    assert action["target"] == "search for python fastapi tutorial"
+    assert "[ACTION:BROWSE]" not in clean_text
 
 
 # ── Browser Lifecycle ─────────────────────────────────────────────────

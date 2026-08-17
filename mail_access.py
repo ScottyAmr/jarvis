@@ -17,6 +17,16 @@ log = logging.getLogger("jarvis.mail")
 _mail_launched = False
 
 
+class MailAccessError(Exception):
+    """Raised when Mail.app couldn't be reached or a query failed/timed out.
+
+    Callers must NOT treat this the same as a genuinely empty result — an
+    empty inbox and a failed query are different facts, and conflating them
+    means JARVIS can confidently report "inbox is clear" when Mail simply
+    never answered.
+    """
+
+
 async def _ensure_mail_running():
     """Launch Mail.app if not already running."""
     global _mail_launched
@@ -52,28 +62,45 @@ async def _ensure_mail_running():
 
 
 async def _run_mail_script(script: str, timeout: float = 20) -> str:
-    """Run an AppleScript against Mail.app and return output."""
+    """Run an AppleScript against Mail.app and return output.
+
+    Raises MailAccessError on failure/timeout — an empty string return value
+    means the script genuinely succeeded with nothing to report.
+    """
     await _ensure_mail_running()
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", script,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
 
         if proc.returncode != 0:
             err = stderr.decode().strip()[:200]
             log.warning(f"Mail script failed: {err}")
-            return ""
+            raise MailAccessError(err or "Mail script failed")
 
         return stdout.decode().strip()
     except asyncio.TimeoutError:
-        log.warning("Mail script timed out")
-        return ""
+        # asyncio.wait_for only stops awaiting on timeout — it does NOT kill the
+        # underlying process. Without this, a timed-out osascript call (seen in
+        # practice: 30+ minutes against a 2600+-message inbox) keeps running as an
+        # orphaned process indefinitely, still holding Mail.app busy in the background.
+        log.warning(f"Mail script timed out after {timeout}s — killing orphaned osascript")
+        proc.kill()
+        await proc.wait()
+        raise MailAccessError(f"Mail script timed out after {timeout}s")
+    except MailAccessError:
+        raise
     except Exception as e:
         log.warning(f"Mail script error: {e}")
-        return ""
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise MailAccessError(str(e))
 
 
 async def get_accounts() -> list[str]:
@@ -108,7 +135,9 @@ tell application "Mail"
     return output
 end tell
 """
-    raw = await _run_mail_script(script)
+    # Measured ~65s on a large inbox — the old 20s default silently timed out
+    # on every call here and got swallowed into a false "0 unread" result.
+    raw = await _run_mail_script(script, timeout=75)
     result = {"total": 0, "accounts": {}}
     for line in raw.split("\n"):
         line = line.strip()
@@ -205,7 +234,9 @@ tell application "Mail"
     return output
 end tell
 """
-    raw = await _run_mail_script(script, timeout=20)
+    # Filtering by read status scans the whole inbox first — same order of
+    # magnitude as get_unread_count, so it needs the same longer timeout.
+    raw = await _run_mail_script(script, timeout=75)
     if not raw:
         return []
 

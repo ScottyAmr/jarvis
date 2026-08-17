@@ -143,14 +143,22 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | `frontend/src/orb.ts` | Three.js particle orb visualization |
 | `frontend/src/voice.ts` | Web Speech API + audio playback |
 | `frontend/src/main.ts` | Frontend state machine |
-| `memory.py` | SQLite memory system with FTS5 full-text search |
-| `calendar_access.py` | Apple Calendar integration via AppleScript |
-| `mail_access.py` | Apple Mail integration (read-only) |
+| `memory.py` | SQLite memory system (facts/tasks/notes) with FTS5 full-text search |
+| `conversation_memory.py` | Persistent raw chat-transcript history + recall across sessions |
+| `calendar_access.py` | Apple Calendar integration via AppleScript (read) |
+| `mail_access.py` | Apple Mail integration (read) |
+| `write_integrations.py` | Send/draft mail, create calendar events, send iMessages |
 | `notes_access.py` | Apple Notes integration |
+| `music_control.py` | Music.app / Spotify playback control via AppleScript |
 | `actions.py` | System actions (Terminal, Chrome, Claude Code) |
 | `browser.py` | Playwright web automation |
 | `work_mode.py` | Persistent Claude Code sessions |
 | `planner.py` | Multi-step task planning with smart questions |
+| `llm_provider.py` | Pluggable LLM backends (Anthropic/Gemini/OpenAI-compatible) with rate-limit fallback chain |
+
+Also present, not yet documented in depth here: `evolution.py`, `learning.py`, `suggestions.py`,
+`tracking.py`, `ab_testing.py`, `qa.py` (a self-improvement/analytics layer), and
+`desktop-overlay/JarvisOverlay.swift` (a native macOS overlay app).
 
 ## Features in Detail
 
@@ -162,12 +170,19 @@ JARVIS uses action tags to trigger real system actions:
 - `[ACTION:PROMPT_PROJECT]` -- connects to an existing project via Claude Code
 - `[ACTION:ADD_TASK]` -- creates a tracked task with priority and due date
 - `[ACTION:REMEMBER]` -- stores a fact for future context
+- `[ACTION:DRAFT_REPLY]` -- reads an email and leaves a reply sitting in Mail as a draft (never sends)
+- `[ACTION:SEND_EMAIL]` -- composes and sends a new email immediately (no confirmation step)
+- `[ACTION:CREATE_EVENT]` -- creates a new Calendar event from natural-language time ("tomorrow 3pm")
+- `[ACTION:SEND_MESSAGE]` -- sends an iMessage/SMS immediately
+- `[ACTION:MUSIC]` -- play/pause/skip/volume/now-playing on Music.app or Spotify (most direct
+  commands are also handled instantly without an LLM round trip)
+- `[ACTION:RECALL]` -- searches past conversations across sessions
 
 ### Memory System
-JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions.
+JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions. Separately, `conversation_memory.py` keeps the raw back-and-forth transcript so JARVIS can recall what you talked about, not just durable facts.
 
 ### Calendar & Mail
-All macOS integrations use AppleScript -- no OAuth flows, no token management. Just native system access. Mail is intentionally read-only for safety.
+All macOS integrations use AppleScript -- no OAuth flows, no token management. Just native system access. JARVIS can read and write both: it drafts replies for review by default, but will compose-and-send a new email or calendar invite immediately when you clearly ask it to -- there's no confirmation step, so be specific when you want a send rather than a draft.
 
 ## Contributing
 

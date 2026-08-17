@@ -18,6 +18,7 @@ __pycache__/
 
 # Data (user-specific, generated at runtime)
 *.db
+*.db.bak
 data/*.jsonl
 data/active_session.json
 data/.jarvis_output.txt

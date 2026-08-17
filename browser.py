@@ -7,6 +7,7 @@ Runs headless Chromium with realistic user agent to avoid blocking.
 
 import asyncio
 import logging
+import os
 import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -19,6 +20,11 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 TIMEOUT_MS = 30_000
+
+# Headless by default — this runs unattended (search/visit/research), and a
+# visible browser stealing focus + leaving tabs open indefinitely is a real
+# UX problem, not a feature. Set JARVIS_BROWSER_HEADLESS=false to watch it work.
+HEADLESS = os.getenv("JARVIS_BROWSER_HEADLESS", "true").lower() not in ("0", "false", "no")
 
 
 # ---------------------------------------------------------------------------
@@ -77,13 +83,12 @@ class JarvisBrowser:
         from playwright.async_api import async_playwright
 
         self._pw = await async_playwright().start()
-        # Launch VISIBLE browser so user can watch JARVIS browse
-        self._browser = await self._pw.chromium.launch(headless=False)
+        self._browser = await self._pw.chromium.launch(headless=HEADLESS)
         self._context = await self._browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 900},
         )
-        log.info("Browser launched (visible Chromium)")
+        log.info(f"Browser launched (headless={HEADLESS})")
 
     async def _new_page(self):
         """Create a new page in the browser context."""
@@ -125,13 +130,10 @@ class JarvisBrowser:
                     ))
 
             log.info(f"Search '{query}' returned {len(results)} results")
-            # Let user see the search results for a moment
-            await asyncio.sleep(2)
         except Exception as e:
             log.warning(f"Search failed for '{query}': {e}")
         finally:
-            # Don't close the page — keep it visible
-            pass
+            await page.close()
 
         return results
 
@@ -179,9 +181,6 @@ class JarvisBrowser:
                 text_content=text,
                 word_count=len(text.split()),
             )
-
-            # Let user see the page for a moment
-            await asyncio.sleep(3)
         except Exception as e:
             log.warning(f"Visit failed for '{url}': {e}")
             return PageContent(
@@ -190,7 +189,8 @@ class JarvisBrowser:
                 text_content=f"Failed to load page: {e}",
                 word_count=0,
             )
-        # Don't close — keep pages visible
+        finally:
+            await page.close()
 
     # -- Screenshot ------------------------------------------------------------
 

@@ -49,7 +49,7 @@ trap cleanup INT TERM
 
 # --- start both servers ------------------------------------------------------
 echo "Starting backend  (port $BACKEND_PORT)..."
-./.venv/bin/python server.py 2>&1 | sed 's/^/[backend]  /' &
+./.venv/bin/python server.py --reload 2>&1 | sed 's/^/[backend]  /' &
 
 echo "Starting frontend (port $FRONTEND_PORT)..."
 ( cd frontend && npm run dev ) 2>&1 | sed 's/^/[frontend] /' &

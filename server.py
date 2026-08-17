@@ -10,6 +10,7 @@ Handles:
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ from typing import Optional
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -59,6 +60,11 @@ from notes_access import get_recent_notes, read_note, search_notes_apple, create
 from dispatch_registry import DispatchRegistry
 from planner import TaskPlanner, detect_planning_mode, BYPASS_PHRASES
 from llm_provider import build_client as build_llm_client, LLMError
+import conversation_memory
+import music_control
+import write_integrations
+import file_organizer
+from integrations.n8n import get_client as get_n8n_client, get_workflow as get_n8n_workflow, describe_workflows_for_prompt as describe_n8n_workflows
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("jarvis")
@@ -104,6 +110,20 @@ USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
+# Names that resolve to JARVIS's own live codebase — dispatching against these
+# always requires an explicit spoken confirmation first (see pending_self_dispatch
+# in websocket_endpoint). A misheard or ambiguous request must never trigger an
+# unattended, skip-permissions Claude Code session against JARVIS's real code.
+_SELF_PROJECT_NAMES = ("jarvis", "jarvis os", Path(PROJECT_DIR).name.lower())
+SELF_DISPATCH_TIMEOUT = 120  # seconds a pending self-modify confirmation stays valid
+SELF_DISPATCH_CONFIRM_PHRASES = (
+    "yes", "yeah", "yep", "yup", "go ahead", "do it", "confirmed",
+    "confirm", "proceed", "sure", "please do", "affirmative", "go for it", "please proceed",
+)
+SELF_DISPATCH_DECLINE_PHRASES = (
+    "no", "nope", "don't", "do not", "cancel", "never mind", "nevermind", "stop", "hold off",
+)
+
 DESKTOP_PATH = Path.home() / "Desktop"
 
 # Roots scanned (depth 1) for git projects JARVIS can work on.
@@ -120,7 +140,10 @@ You are JARVIS — Just A Rather Very Intelligent System — {user_name}'s AI as
 
 VOICE:
 - British butler elegance, understated dry wit. Address {user_name} as "sir" naturally, not every sentence.
-- Economy of language: say more with less, no filler or corporate-speak. Humor is observational, never jokes.
+- Economy of language: say more with less, no filler or corporate-speak. Wit is welcome — a dry aside, a
+  playful jab, an arch understatement — but it rides ALONGSIDE the answer, never instead of it, and never
+  costs you the sentence limit below. One playful line beats three. Read the room: a genuine problem gets
+  calm competence, not a quip.
 - Deliver bad news calmly, like weather: "We have a slight problem, sir." When things go wrong, get CALMER.
 - Lead status reports with data first. Don't know something: "I'm afraid I don't have that, sir."
 
@@ -132,15 +155,23 @@ NEVER say: "Absolutely", "Great question", "I'd be happy to", "Of course", "How 
 Never start a sentence with "I". Never break character.
 Prefer: "Will do, sir." / "Right away, sir." / "Understood." / "Consider it done." / "Done, sir."
 
+BUSINESS MINDSET: You think like a sharp chief of staff, not a search box. When it's relevant, weigh cost,
+time, and priority rather than executing blindly — flag the cheaper or faster path, note when something is
+worth doing versus worth skipping, and connect requests to what actually moves {user_name}'s work forward.
+If a build, purchase, or plan has an obvious catch (cost, risk, a better sequencing), say so in one line before
+acting, then act. This is judgment, not hesitation — you still default to doing over asking.
+
 SELF-AWARENESS: You ARE the JARVIS project at {project_dir}, built by {user_name} (Python FastAPI + WebSocket
 voice). Asked about your own code — use [ACTION:PROMPT_PROJECT] on the jarvis project.
 
 CAPABILITIES (these are REAL — never say you "can't" do them):
-- You READ {user_name}'s email through Apple Mail, including Gmail accounts set up there (e.g. their
-  gmail) — unread counts, recent messages, search. It is READ-ONLY: you cannot send, delete, or manage
-  mail, and you do NOT need OAuth or "connecting" — it already works. The current mail summary is in LIVE CONTEXT.
-- You READ their calendar/schedule and Apple Notes, and SEE their screen (open apps + screenshot vision).
-- You manage tasks and remember durable facts, browse the web, research, and build/work on code projects.
+- You READ AND SEND {user_name}'s email through Apple Mail, including Gmail accounts set up there — unread
+  counts, recent messages, search, drafting replies, composing and sending new mail. You do NOT need OAuth
+  or "connecting" — it already works. The current mail summary is in LIVE CONTEXT.
+- You READ their calendar/schedule and CREATE new calendar events, and READ + CREATE Apple Notes.
+- You SEE their screen (open apps + screenshot vision), control Music/Spotify playback, and send iMessages.
+- You manage tasks, remember durable facts, recall past conversations, browse the web, research, and
+  build/work on code projects.
 Current time, weather, schedule, email, and screen are always in the LIVE CONTEXT below — check it before
 saying you don't know.
 
@@ -161,13 +192,46 @@ say "I built X", never "Claude Code did X".
 - [ACTION:REMEMBER] content — store a DURABLE fact/preference/decision about {user_name} (e.g. "prefers
   React", "based in Melbourne"). NEVER remember meta-commentary, test confirmations, greetings, or transient
   status ("memory works", "restarted"). If it won't matter next week, don't store it.
-- [ACTION:DRAFT_REPLY] subject-search — read the email matching that subject and draft a reply. The draft is
-  shown to {user_name} for review — NOTHING is sent. Stay in voice/character. Keep the draft concise and professional.
+- [ACTION:DRAFT_REPLY] subject-search — read the email matching that subject, draft a reply, and leave it
+  sitting in Mail as a draft. NOTHING is sent — use this when {user_name} wants to review before sending.
+- [ACTION:SEND_EMAIL] to ||| subject ||| body — compose AND SEND a new email immediately. This actually
+  sends, no confirmation step — only use it when the intent to send now is clear (e.g. "email Alex and tell
+  him..."). If they might want to review first, use DRAFT_REPLY-style phrasing instead ("draft that" → prefer
+  a draft over guessing send).
+- [ACTION:CREATE_EVENT] title ||| when ||| duration_minutes ||| location ||| notes — only title and when are
+  required (duration defaults to 60, location/notes may be empty). "when" accepts natural language: "tomorrow
+  3pm", "friday 10am", "in 2 hours".
+- [ACTION:SEND_MESSAGE] to ||| body — send an iMessage/SMS. Sends immediately, no confirmation.
+- [ACTION:MUSIC] command ||| query-or-level — command is one of play/pause/next/previous/volume/now_playing.
+  Most direct commands ("play some jazz", "pause") are handled instantly without you — only use this tag for
+  less direct conversational requests ("something upbeat would help right now").
+- [ACTION:SHOPPING] command ||| items — command is one of add/list/check. Direct phrasing ("add milk to my
+  shopping list", "what's on my list", "check off eggs") is handled instantly without you — only use this tag
+  for indirect phrasing where the shopping-list intent isn't explicit ("we're out of milk", "remind me we
+  need bread"). "items" is a comma-separated list for add/check, empty for list.
+- [ACTION:RECALL] query — search past conversations across sessions (distinct from REMEMBER, which is
+  durable facts). Use when {user_name} references something said in an earlier session you don't have in
+  the current LIVE CONTEXT.
+- [ACTION:N8N] workflow_id ||| field1=value1 ||| field2=value2 — trigger a registered n8n automation
+  (external services this session can't reach directly — email pipelines, CRMs, social platforms, leads,
+  scheduled jobs). Only use a workflow_id listed under N8N WORKFLOWS in LIVE CONTEXT below — never invent
+  one. Use plain field=value pairs, not JSON. Workflows marked CONFIRM will hold for your explicit yes/no
+  before firing — that's expected, just ask naturally and wait.
 - [ACTION:ADD_NOTE] topic ||| content   ·   [ACTION:CREATE_NOTE] title ||| body   ·   [ACTION:READ_NOTE] title-search
+- [ACTION:ORGANIZE] scope — dry-run scan of Downloads/Desktop clutter (scope: "downloads", "desktop", or empty for
+  both). Produces an HTML report of proposed sorting + likely duplicates and opens it in Chrome. NEVER moves or
+  deletes anything by itself. Use when {user_name} asks to clean up, sort, or organize files.
+- [ACTION:ORGANIZE_CONFIRM] — apply the most recent ORGANIZE dry-run (must be from the last hour, or it's
+  refused). Sorts files into category subfolders and sends exact duplicates to the Trash (reversible, never a
+  hard delete). ONLY fire this after {user_name} has seen a dry-run report and clearly confirms — "do it",
+  "go ahead", "yes organize". Never fire ORGANIZE_CONFIRM on the same turn as ORGANIZE.
 
 ACTION RULES:
 - NO tags for casual conversation, or while the user is still explaining. When in doubt, just talk.
 - Don't [ACTION:BROWSE] merely because a URL is mentioned.
+- SEND_EMAIL, SEND_MESSAGE, and CREATE_EVENT are irreversible-ish and go out under {user_name}'s name — only
+  fire them when the request is unambiguous. A vague or exploratory request ("what should I say to Alex?")
+  is conversation, not a send.
 - Builds/dispatches: check the DISPATCHES section rather than re-dispatching or guessing progress or ports;
   "pull it up" → [ACTION:BROWSE] the URL shown there. Never hallucinate build progress.
 - Planning the day: don't dispatch — discuss priorities, then [ACTION:ADD_TASK] / [ACTION:ADD_NOTE] as agreed.
@@ -211,6 +275,9 @@ If the DISPATCHES section shows a recent completed result for a project, DO NOT 
 
 KNOWN PROJECTS:
 {known_projects}
+
+N8N WORKFLOWS (only these workflow_ids are valid for [ACTION:N8N] — never invent one):
+{n8n_workflows}
 """
 
 
@@ -491,72 +558,6 @@ class ClaudeTaskManager:
         except:
             pass
 
-        # Auto-QA on completed tasks
-        if task.status == "completed":
-            asyncio.create_task(self._run_qa(task))
-
-    async def _run_qa(self, task: ClaudeTask, attempt: int = 1):
-        """Run QA verification on a completed task, auto-retry on failure."""
-        try:
-            qa_result = await qa_agent.verify(task.prompt, task.result, task.working_dir)
-            duration = task.elapsed_seconds
-
-            if qa_result.passed:
-                log.info(f"Task {task.id} passed QA: {qa_result.summary}")
-                success_tracker.log_task("dev", task.prompt, True, attempt - 1, duration)
-                await self._notify({
-                    "type": "qa_result",
-                    "task_id": task.id,
-                    "passed": True,
-                    "summary": qa_result.summary,
-                })
-
-                # Proactive suggestion after successful task
-                suggestion = suggest_followup(
-                    task_type="dev",
-                    task_description=task.prompt,
-                    working_dir=task.working_dir,
-                    qa_result=qa_result,
-                )
-                if suggestion:
-                    success_tracker.log_suggestion(task.id, suggestion.text)
-                    await self._notify({
-                        "type": "suggestion",
-                        "task_id": task.id,
-                        "text": suggestion.text,
-                        "action_type": suggestion.action_type,
-                        "action_details": suggestion.action_details,
-                    })
-            else:
-                log.warning(f"Task {task.id} failed QA: {qa_result.issues}")
-                if attempt < 3:
-                    log.info(f"Auto-retrying task {task.id} (attempt {attempt + 1}/3)")
-                    retry_result = await qa_agent.auto_retry(
-                        task.prompt, qa_result.issues, task.working_dir, attempt,
-                    )
-                    if retry_result["status"] == "completed":
-                        task.result = retry_result["result"]
-                        # Re-verify
-                        await self._run_qa(task, attempt + 1)
-                    else:
-                        success_tracker.log_task("dev", task.prompt, False, attempt, duration)
-                        await self._notify({
-                            "type": "qa_result",
-                            "task_id": task.id,
-                            "passed": False,
-                            "summary": f"Failed after {attempt + 1} attempts: {qa_result.issues}",
-                        })
-                else:
-                    success_tracker.log_task("dev", task.prompt, False, attempt, duration)
-                    await self._notify({
-                        "type": "qa_result",
-                        "task_id": task.id,
-                        "passed": False,
-                        "summary": f"Failed QA after {attempt} attempts: {qa_result.issues}",
-                    })
-        except Exception as e:
-            log.error(f"QA error for task {task.id}: {e}")
-
     async def get_status(self, task_id: str) -> Optional[ClaudeTask]:
         return self._tasks.get(task_id)
 
@@ -809,7 +810,7 @@ def extract_action(response: str) -> tuple[str, dict | None]:
     # "[Action:REMEMBER]" or "[ ACTION: REMEMBER ]"; parse those too so a
     # malformed tag is stripped from speech rather than spoken aloud.
     match = _action_re.search(
-        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|DRAFT_REPLY)\s*\]\s*(.*?)$',
+        r'\[\s*ACTION\s*:\s*(BUILD|BROWSE|RESEARCH|OPEN_TERMINAL|PROMPT_PROJECT|ADD_TASK|ADD_NOTE|COMPLETE_TASK|REMEMBER|CREATE_NOTE|READ_NOTE|SCREEN|DRAFT_REPLY|SEND_EMAIL|CREATE_EVENT|SEND_MESSAGE|MUSIC|RECALL|ORGANIZE|ORGANIZE_CONFIRM|SHOPPING|N8N)\s*\]\s*(.*?)$',
         response, _action_re.DOTALL | _action_re.IGNORECASE,
     )
     if match:
@@ -960,7 +961,7 @@ def _find_project_dir(project_name: str) -> str | None:
     q = project_name.lower().strip()
 
     # JARVIS asking about itself — always resolve to its real home.
-    if q in ("jarvis", "jarvis os", Path(PROJECT_DIR).name.lower()):
+    if q in _SELF_PROJECT_NAMES:
         return str(Path(PROJECT_DIR).resolve())
 
     for p in cached_projects:
@@ -1375,6 +1376,7 @@ async def generate_response(
         active_tasks=task_mgr.get_active_tasks_summary(),
         dispatch_context=dispatch_registry.format_for_prompt(),
         known_projects=format_projects_for_prompt(projects),
+        n8n_workflows=describe_n8n_workflows(),
     )
     if lookup_status:
         dynamic_system += f"\n\nACTIVE LOOKUPS:\n{lookup_status}\nIf asked about progress, report this status."
@@ -1645,6 +1647,44 @@ async def health():
     return {"status": "online", "name": "JARVIS", "version": "0.1.0"}
 
 
+@app.get("/api/n8n/health")
+async def n8n_health():
+    """Report whether the n8n bridge is configured and reachable — used by the
+    settings UI later, and handy for manual troubleshooting now."""
+    client = get_n8n_client()
+    if not client.configured:
+        return {"configured": False, "ok": False, "message": "n8n isn't configured (set N8N_BASE_URL in .env)"}
+    result = await client.health_check()
+    return {"configured": True, **result}
+
+
+@app.post("/api/n8n/webhook")
+async def n8n_webhook(request: Request):
+    """Receive an async callback from an n8n workflow that doesn't respond
+    synchronously to its trigger. Validates the shared-secret HMAC signature
+    before touching the body — an unsigned or mis-signed request is rejected,
+    never processed. Phase 1 just logs and acknowledges; routing a callback
+    back to a specific live voice session is future work."""
+    secret = os.getenv("N8N_WEBHOOK_SECRET", "")
+    body = await request.body()
+    if secret:
+        signature = request.headers.get("X-N8N-Signature", "")
+        expected = hmac.new(secret.encode(), body, "sha256").hexdigest()
+        if not signature or not hmac.compare_digest(signature, expected):
+            log.warning("n8n webhook: signature mismatch, rejecting")
+            return JSONResponse({"ok": False, "error": "invalid signature"}, status_code=401)
+    else:
+        log.warning("n8n webhook received but N8N_WEBHOOK_SECRET isn't set — accepting unverified")
+
+    try:
+        payload = json.loads(body) if body else {}
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid JSON body"}, status_code=400)
+
+    log.info(f"n8n webhook callback received: {str(payload)[:300]}")
+    return {"ok": True}
+
+
 @app.get("/api/tts-test")
 async def tts_test():
     """Generate a test audio clip for debugging."""
@@ -1727,21 +1767,23 @@ async def api_context():
     except Exception:
         nxt = None
     try:
-        unread = await get_unread_count()
-    except Exception:
-        unread = {}
-    try:
         todos = get_open_tasks()
     except Exception:
         todos = []
+    # Unread count comes from the cache, NOT a live call — Mail's AppleScript
+    # query can take over a minute on a large inbox, and this endpoint is
+    # polled by the UI and must never block on it (see docstring above).
+    mail = _ctx_cache.get("mail", "")
+    _m = re.search(r"(\d[\d,]*)\s+unread", mail, re.IGNORECASE)
+    unread_count = int(_m.group(1).replace(",", "")) if _m else 0
     return {
         "weather": _ctx_cache.get("weather", ""),
         "calendar": _ctx_cache.get("calendar", ""),
-        "mail": _ctx_cache.get("mail", ""),
+        "mail": mail,
         "screen": _ctx_cache.get("screen", ""),
         "events": events,
         "next_event": nxt,
-        "unread_count": unread.get("count", 0) if isinstance(unread, dict) else 0,
+        "unread_count": unread_count,
         "tasks": todos,
         "user_name": USER_NAME,
     }
@@ -1910,8 +1952,14 @@ async def _draft_reply_and_report(subject_search: str, ws, history: list[dict], 
             else:
                 draft_text = "(LLM unavailable — can't generate draft right now.)"
 
-            msg = f"Here's a draft reply to {sender}. Re: {email['subject']}. {draft_text}"
-            log.info(f"Draft reply composed for: {email['subject']}")
+            # Actually place the draft in Mail.app so it's there to review/send,
+            # not just spoken aloud. Still never sends anything.
+            placed = await write_integrations.reply_to_message(email["subject"], draft_text)
+            if placed.get("ok"):
+                msg = f"Here's a draft reply to {sender}, sitting in Mail for you. Re: {email['subject']}. {draft_text}"
+            else:
+                msg = f"Here's a draft reply to {sender}. Re: {email['subject']}. {draft_text}"
+            log.info(f"Draft reply composed for: {email['subject']} (placed_in_mail={placed.get('ok')})")
 
         audio = await synthesize_speech(strip_markdown_for_tts(msg))
         if audio and ws:
@@ -1922,6 +1970,240 @@ async def _draft_reply_and_report(subject_search: str, ws, history: list[dict], 
                 pass
     except Exception as e:
         log.error(f"Draft reply failed: {e}")
+        await _speak(ws, "Something went wrong drafting that reply, sir.")
+
+
+async def _speak(ws, msg: str):
+    """Synthesize and send a spoken response for a background-task result."""
+    if not ws:
+        return
+    try:
+        audio = await synthesize_speech(strip_markdown_for_tts(msg))
+        await ws.send_json({"type": "status", "state": "speaking"})
+        if audio:
+            await ws.send_json({"type": "audio", "data": base64.b64encode(audio).decode(), "text": msg})
+        else:
+            await ws.send_json({"type": "text", "text": msg})
+            await ws.send_json({"type": "status", "state": "idle"})
+    except Exception:
+        pass
+
+
+async def _send_email_and_report(target: str, ws):
+    """Parse `to ||| subject ||| body` and send via write_integrations. SENDS immediately."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        if len(parts) < 3 or not all(parts[:3]):
+            await _speak(ws, "I need a recipient, subject, and body to send that, sir.")
+            return
+        to, subject, body = parts[0], parts[1], parts[2]
+        result = await write_integrations.send_email(to, subject, body)
+        msg = f"{result['message']}, sir." if result["ok"] else f"Couldn't send that: {result['message']}, sir."
+        log.info(f"send_email to={to} ok={result['ok']}")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"send_email action failed: {e}")
+        await _speak(ws, "Something went wrong sending that, sir.")
+
+
+async def _create_event_and_report(target: str, ws):
+    """Parse `title ||| when ||| duration_minutes ||| location ||| notes` (last three optional)."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            await _speak(ws, "I need at least a title and a time for that event, sir.")
+            return
+        title, when = parts[0], parts[1]
+        duration = 60
+        if len(parts) > 2:
+            dur_match = re.match(r"\d+", parts[2].strip())
+            if dur_match:
+                duration = int(dur_match.group(0))
+        location = parts[3] if len(parts) > 3 else ""
+        notes = parts[4] if len(parts) > 4 else ""
+        result = await write_integrations.create_calendar_event(
+            title, when, duration_minutes=duration, location=location, notes=notes,
+        )
+        msg = f"{result['message']}, sir." if result["ok"] else f"Couldn't create that event: {result['message']}, sir."
+        log.info(f"create_event title={title} ok={result['ok']}")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"create_event action failed: {e}")
+        await _speak(ws, "Something went wrong creating that event, sir.")
+
+
+async def _send_message_and_report(target: str, ws):
+    """Parse `to ||| body` and send an iMessage. SENDS immediately."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        if len(parts) < 2 or not all(parts[:2]):
+            await _speak(ws, "I need a recipient and a message to send, sir.")
+            return
+        to, body = parts[0], parts[1]
+        result = await write_integrations.send_imessage(to, body)
+        msg = f"{result['message']}, sir." if result["ok"] else f"Couldn't send that: {result['message']}, sir."
+        log.info(f"send_imessage to={to} ok={result['ok']}")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"send_imessage action failed: {e}")
+        await _speak(ws, "Something went wrong sending that, sir.")
+
+
+async def _music_action_and_report(target: str, ws):
+    """Parse `command ||| query-or-level` for the LLM-driven [ACTION:MUSIC] tag."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        command = (parts[0] if parts else "").lower()
+        arg = parts[1] if len(parts) > 1 else ""
+        if command == "play":
+            result = await music_control.play(arg)
+        elif command == "pause":
+            result = await music_control.pause()
+        elif command == "next":
+            result = await music_control.next_track()
+        elif command in ("previous", "prev"):
+            result = await music_control.previous_track()
+        elif command == "volume":
+            # The LLM occasionally glues trailing narrative onto the last |||
+            # field (e.g. "volume|||0Done, sir."). Extract only the leading
+            # number rather than trusting the whole field as a clean int.
+            num_match = re.match(r"-?\d+", arg.strip())
+            level = int(num_match.group(0)) if num_match else 50
+            result = await music_control.set_volume(level)
+        elif command in ("now_playing", "now-playing", "nowplaying"):
+            result = await music_control.now_playing()
+        else:
+            result = {"ok": False, "message": f"Unrecognized music command '{command}'"}
+        await _speak(ws, f"{result['message']}, sir.")
+    except Exception as e:
+        log.error(f"music action failed: {e}")
+        await _speak(ws, "Something went wrong with the music, sir.")
+
+
+async def _shopping_action_and_report(target: str, ws):
+    """Parse `command ||| items` for the LLM-driven [ACTION:SHOPPING] tag —
+    used for indirect phrasing ("we're out of milk") that the shopping_add/
+    shopping_list/shopping_check fast-path regexes won't catch."""
+    try:
+        parts = [p.strip() for p in target.split("|||")]
+        command = (parts[0] if parts else "").lower()
+        items = parts[1] if len(parts) > 1 else ""
+        if command == "add":
+            msg = _shopping_add(items)
+        elif command == "list":
+            msg = _shopping_list_voice()
+        elif command == "check":
+            msg = _shopping_check(items)
+        else:
+            msg = f"Unrecognized shopping list command '{command}', sir."
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"shopping action failed: {e}")
+        await _speak(ws, "Something went wrong with your shopping list, sir.")
+
+
+async def _recall_and_report(query: str, ws, current_session_id: str):
+    try:
+        msg = _voice_conversation_recall(query.strip(), current_session_id)
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"conversation recall action failed: {e}")
+        await _speak(ws, "Couldn't search past conversations, sir.")
+
+
+def _resolve_n8n_confirmation(pending: dict | None, t_lower: str, now: float | None = None) -> str:
+    """Resolve a pending CONFIRM-tier n8n action against the next utterance.
+    Returns 'confirm' or 'decline' if this utterance is a yes/no reply to a
+    still-valid pending action, else 'none' (nothing pending, expired, or
+    this utterance isn't a yes/no reply). Reuses the same phrase lists and
+    timeout as the existing self-dispatch confirmation gate — same shape,
+    new slot, not reinvented."""
+    if pending is None:
+        return "none"
+    now = time.time() if now is None else now
+    if now - pending["ts"] >= SELF_DISPATCH_TIMEOUT:
+        return "none"
+    if any(p in t_lower for p in SELF_DISPATCH_CONFIRM_PHRASES):
+        return "confirm"
+    if any(p in t_lower for p in SELF_DISPATCH_DECLINE_PHRASES):
+        return "decline"
+    return "none"
+
+
+def _parse_n8n_target(target: str) -> tuple[str, dict]:
+    """Parse `workflow_id ||| field1=value1 ||| field2=value2` into
+    (workflow_id, payload). Flat key=value pairs, not embedded JSON — the
+    same |||-delimited-field bug (trailing LLM narrative glued onto the last
+    field) that hit ADD_TASK's due_date and MUSIC's volume this session would
+    be much worse with JSON in the mix, so this format sidesteps it entirely.
+    A field with no '=' is dropped rather than guessed at."""
+    parts = [p.strip() for p in target.split("|||")]
+    workflow_id = parts[0].lower() if parts else ""
+    payload: dict = {}
+    for field in parts[1:]:
+        if "=" in field:
+            key, _, value = field.partition("=")
+            key = key.strip()
+            if key:
+                payload[key] = value.strip()
+    return workflow_id, payload
+
+
+async def _n8n_action_and_report(workflow_id: str, payload: dict, ws):
+    """Fire an n8n workflow immediately (READ_ONLY/AUTONOMOUS tier, or an
+    already-confirmed CONFIRM-tier one) and speak the structured result."""
+    try:
+        client = get_n8n_client()
+        wf = get_n8n_workflow(workflow_id)
+        if wf is None:
+            await _speak(ws, f"I don't have a workflow called '{workflow_id}' registered, sir.")
+            return
+        result = await client.trigger_workflow(wf["webhook_path"], payload, timeout=wf.get("timeout"))
+        if result["ok"]:
+            msg = f"Done, sir — {workflow_id} completed."
+        else:
+            msg = f"Couldn't run {workflow_id}: {result['message']}, sir."
+        log.info(f"n8n action workflow={workflow_id} ok={result['ok']} kind={result.get('kind')}")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"n8n action failed: {e}")
+        await _speak(ws, f"Something went wrong running {workflow_id}, sir.")
+
+
+async def _organize_and_report(target: str, ws):
+    """Dry-run scan of Downloads/Desktop clutter. Read-only — never moves or deletes."""
+    try:
+        dirs = file_organizer.parse_scope(target)
+        plan = await asyncio.to_thread(file_organizer.scan, dirs)
+        file_organizer.save_plan(plan)
+        report_path = await asyncio.to_thread(file_organizer.render_report_html, plan)
+        await open_browser(f"file://{report_path}")
+        msg = file_organizer.summarize_plan(plan)
+        log.info(f"Organize dry-run: {len(plan['moves'])} moves, {len(plan['duplicates'])} duplicates")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"organize scan failed: {e}")
+        await _speak(ws, "Something went wrong scanning your files, sir.")
+
+
+async def _organize_confirm_and_report(ws):
+    """Apply the most recent organize dry-run — refuses if there's no recent plan."""
+    try:
+        plan = file_organizer.load_plan()
+        if not plan:
+            await _speak(ws, "I don't have a recent scan to apply, sir — ask me to organize again first.")
+            return
+        result = await file_organizer.apply_plan(plan)
+        file_organizer.clear_plan()
+        if result["move_errors"] or result["trash_errors"]:
+            msg = f"Sorted {result['moved']} files and sent {result['trashed']} duplicates to Trash, though a few wouldn't budge, sir."
+        else:
+            msg = f"Sorted {result['moved']} files and sent {result['trashed']} duplicates to Trash, sir."
+        log.info(f"Organize applied: {result}")
+        await _speak(ws, msg)
+    except Exception as e:
+        log.error(f"organize confirm failed: {e}")
+        await _speak(ws, "Something went wrong applying that, sir.")
 
 
 def _recall_memories(topic: str) -> str:
@@ -1933,6 +2215,74 @@ def _recall_memories(topic: str) -> str:
     for m in results[:5]:
         parts.append(m.get("content", ""))
     return " ".join(parts)
+
+
+def _voice_conversation_recall(topic: str, current_session_id: str) -> str:
+    """Search or summarize past conversation turns and format for voice."""
+    if topic:
+        return conversation_memory.format_search_for_voice(topic)
+    recent = conversation_memory.get_recent(limit=20)
+    prior = [r for r in recent if r["session_id"] != current_session_id]
+    if not prior:
+        return "This is our first conversation, sir — nothing to recall yet."
+    last_user = next((r for r in reversed(prior) if r["role"] == "user"), None)
+    if not last_user:
+        return "Nothing notable from last time, sir."
+    return f"Last time you brought up: {last_user['content'][:150]}"
+
+
+SHOPPING_PROJECT = "shopping"
+
+
+def _split_items(raw: str) -> list[str]:
+    """Split '\"milk, eggs and bread\"' into ['milk', 'eggs', 'bread']."""
+    raw = re.sub(r"\band\b", ",", raw, flags=re.IGNORECASE)
+    return [i.strip() for i in raw.split(",") if i.strip()]
+
+
+def _shopping_add(raw_items: str) -> str:
+    items = _split_items(raw_items)
+    if not items:
+        return "I didn't catch what to add, sir."
+    for item in items:
+        create_task(title=item, project=SHOPPING_PROJECT)
+    if len(items) == 1:
+        return f"Added {items[0]} to your shopping list, sir."
+    return f"Added {', '.join(items[:-1])} and {items[-1]} to your shopping list, sir."
+
+
+def _shopping_list_voice() -> str:
+    open_items = get_open_tasks(project=SHOPPING_PROJECT)
+    if not open_items:
+        return "Your shopping list is empty, sir."
+    names = [t["title"] for t in open_items]
+    if len(names) == 1:
+        return f"One thing on your list, sir: {names[0]}."
+    return f"Your shopping list, sir: {', '.join(names[:-1])}, and {names[-1]}."
+
+
+def _shopping_check(raw_query: str) -> str:
+    """Mark one or more shopping-list items done by fuzzy name match."""
+    items = _split_items(raw_query)
+    if not items:
+        return "I didn't catch what to check off, sir."
+    open_items = get_open_tasks(project=SHOPPING_PROJECT)
+    done, not_found = [], []
+    for item in items:
+        match = next((t for t in open_items if item.lower() in t["title"].lower()
+                      or t["title"].lower() in item.lower()), None)
+        if match:
+            complete_task(match["id"])
+            open_items = [t for t in open_items if t["id"] != match["id"]]  # don't double-match
+            done.append(match["title"])
+        else:
+            not_found.append(item)
+    parts = []
+    if done:
+        parts.append(f"Checked off {', '.join(done)}")
+    if not_found:
+        parts.append(f"couldn't find {', '.join(not_found)} on your list")
+    return ", ".join(parts) + ", sir." if parts else "Nothing on your list matched that, sir."
 
 
 # -- Fast Action Detection (no LLM call) -----------------------------------
@@ -2056,6 +2406,53 @@ def detect_action_fast(text: str) -> dict | None:
         if topic and len(topic) > 2:
             return {"action": "memory_recall", "topic": topic}
 
+    # Conversation recall — distinct from memory_recall (facts) — searches raw chat history
+    convo_match = re.match(r"what did we (?:talk|chat) about(?: regarding| about)?\s*(.*)", t)
+    if convo_match:
+        topic = convo_match.group(1).strip().rstrip("?")
+        return {"action": "conversation_recall", "topic": topic}
+    if t.rstrip("?") in ("last time we spoke", "last time we talked",
+                          "what did we discuss last time", "what did we talk about last time"):
+        return {"action": "conversation_recall", "topic": ""}
+
+    # Music — play/pause/skip/volume/now playing (Music.app or Spotify, whichever is open)
+    play_match = re.match(r"(?:play|put on|throw on)\s+(.+)", t)
+    if play_match and not any(w in t for w in ["video", "game"]):
+        return {"action": "music_play", "query": play_match.group(1).strip()}
+    if t in ("play music", "play some music", "resume music", "resume the music", "unpause music"):
+        return {"action": "music_play", "query": ""}
+    if any(p in t for p in ["pause the music", "pause music", "stop the music", "stop music"]):
+        return {"action": "music_pause"}
+    if any(p in t for p in ["skip this song", "skip song", "skip track", "next song", "next track"]):
+        return {"action": "music_next"}
+    if any(p in t for p in ["previous song", "previous track", "last song", "go back a song",
+                             "play the last song", "play the previous song"]):
+        return {"action": "music_previous"}
+    if any(p in t for p in ["what's playing", "whats playing", "what song is this",
+                             "what song is playing", "now playing", "what's this song",
+                             "whats this song"]):
+        return {"action": "music_now_playing"}
+    volume_match = re.search(r"volume to (\d{1,3})", t)
+    if volume_match:
+        return {"action": "music_volume", "level": int(volume_match.group(1))}
+
+    # Shopping list — backed by memory.py's tasks table (project="shopping"), not a
+    # separate store. "add X to my shopping/grocery list" / "what's on my list" /
+    # "check off X" / "remove X from my list".
+    shop_add_match = re.match(
+        r"(?:add|put)\s+(.+?)\s+(?:to|on)\s+(?:my |the )?(?:shopping|grocery) list", t)
+    if shop_add_match:
+        return {"action": "shopping_add", "items": shop_add_match.group(1).strip()}
+    if (re.match(r"(?:what'?s on|read(?: me)?) (?:my |the )?(?:shopping|grocery) list", t)
+            or re.match(r"what do i need(?: to buy| from the (?:shop|store|supermarket))?$", t)):
+        return {"action": "shopping_list"}
+    shop_check_match = (
+        re.match(r"(?:check off|cross off)\s+(.+?)(?:\s+(?:from|off)\s+(?:my |the )?(?:shopping|grocery) list)?$", t)
+        or re.match(r"remove\s+(.+?)\s+(?:from|off)\s+(?:my |the )?(?:shopping|grocery) list", t)
+    )
+    if shop_check_match:
+        return {"action": "shopping_check", "items": shop_check_match.group(1).strip()}
+
     return None  # Everything else goes to the LLM for conversational routing
 
 
@@ -2133,7 +2530,7 @@ async def handle_show_recent() -> str:
 _active_lookups: dict[str, dict] = {}  # id -> {"type": str, "status": str, "started": float}
 
 
-async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None, voice_state: dict = None):
+async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict] = None, voice_state: dict = None, timeout: float = 30):
     """Run a slow lookup, then speak the result back.
 
     JARVIS stays conversational — this runs completely off the main path.
@@ -2150,7 +2547,7 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
         # asyncio.create_subprocess_exec so they don't block the event loop
         result_text = await asyncio.wait_for(
             lookup_fn(),
-            timeout=30,
+            timeout=timeout,
         )
 
         _active_lookups[lookup_id]["status"] = "done"
@@ -2192,6 +2589,15 @@ async def _lookup_and_report(lookup_type: str, lookup_fn, ws, history: list[dict
     except Exception as e:
         _active_lookups[lookup_id]["status"] = "error"
         log.warning(f"Lookup {lookup_type} failed: {e}")
+        try:
+            fallback = f"Couldn't complete that {lookup_type} check, sir."
+            audio = await synthesize_speech(fallback)
+            await ws.send_json({"type": "status", "state": "speaking"})
+            if audio:
+                await ws.send_json({"type": "audio", "data": audio, "text": fallback})
+            await ws.send_json({"type": "status", "state": "idle"})
+        except Exception:
+            pass
     finally:
         # Clean up after 60s
         await asyncio.sleep(60)
@@ -2421,6 +2827,7 @@ async def voice_handler(ws: WebSocket):
     await ws.accept()
     task_manager.register_websocket(ws)
     history: list[dict] = []
+    session_id = uuid.uuid4().hex[:12]
     work_session = WorkSession()
     planner = TaskPlanner()
 
@@ -2430,6 +2837,14 @@ async def voice_handler(ws: WebSocket):
 
     # Audio collision prevention — track when user last spoke
     voice_state = {"last_user_time": 0.0}
+
+    # Self-modification gate — set when a PROMPT_PROJECT tag targets JARVIS's own
+    # codebase; the dispatch only fires once the user confirms on a follow-up turn.
+    pending_self_dispatch: dict | None = None
+
+    # n8n CONFIRM-tier gate — set when an [ACTION:N8N] tag targets a workflow whose
+    # registry permission is CONFIRM; only fires once the user confirms next turn.
+    pending_n8n_action: dict | None = None
 
     # Self-awareness — track last spoken response to avoid repetition
     last_jarvis_response = ""
@@ -2515,7 +2930,7 @@ async def voice_handler(ws: WebSocket):
             _cancel_response = False
 
             voice_state["last_user_time"] = time.time()
-            log.info(f"User: {user_text}")
+            log.info(f"User: {user_text[:500]}{'...' if len(user_text) > 500 else ''}")
             await ws.send_json({"type": "status", "state": "thinking"})
 
             # Lazy project scan on first message
@@ -2535,6 +2950,12 @@ async def voice_handler(ws: WebSocket):
             try:
                 # ── CHECK FOR MODE SWITCHES ──
                 t_lower = user_text.lower()
+
+                # A pending n8n CONFIRM that's timed out without a reply should
+                # just quietly disappear rather than hijacking the next unrelated
+                # message as if it were a yes/no answer.
+                if pending_n8n_action is not None and time.time() - pending_n8n_action["ts"] >= SELF_DISPATCH_TIMEOUT:
+                    pending_n8n_action = None
 
                 # ── PLANNING MODE: answering clarifying questions ──
                 if planner.is_planning:
@@ -2579,6 +3000,35 @@ async def voice_handler(ws: WebSocket):
                             response_text = result.get("confirmation_summary", "Ready to build. Shall I proceed, sir?")
                         else:
                             response_text = result.get("next_question", "What else, sir?")
+
+                # ── SELF-MODIFY CONFIRMATION: awaiting yes/no on a pending self-dispatch ──
+                elif (
+                    pending_self_dispatch is not None
+                    and time.time() - pending_self_dispatch["ts"] < SELF_DISPATCH_TIMEOUT
+                    and any(p in t_lower for p in SELF_DISPATCH_CONFIRM_PHRASES + SELF_DISPATCH_DECLINE_PHRASES)
+                ):
+                    if any(p in t_lower for p in SELF_DISPATCH_CONFIRM_PHRASES):
+                        self_prompt = pending_self_dispatch["prompt"]
+                        did = dispatch_registry.register("jarvis", PROJECT_DIR, self_prompt)
+                        asyncio.create_task(
+                            _execute_prompt_project("jarvis", self_prompt, work_session, ws,
+                                                     dispatch_id=did, history=history, voice_state=voice_state)
+                        )
+                        response_text = "Right, going ahead with that now, sir."
+                    else:
+                        response_text = "Understood — I'll leave my own code alone, sir."
+                    pending_self_dispatch = None
+
+                # ── N8N CONFIRMATION: awaiting yes/no on a pending CONFIRM-tier workflow ──
+                elif (_n8n_verdict := _resolve_n8n_confirmation(pending_n8n_action, t_lower)) != "none":
+                    if _n8n_verdict == "confirm":
+                        wf_id = pending_n8n_action["workflow_id"]
+                        wf_payload = pending_n8n_action["payload"]
+                        asyncio.create_task(_n8n_action_and_report(wf_id, wf_payload, ws))
+                        response_text = "Right, sending that through now, sir."
+                    else:
+                        response_text = "Understood — I'll leave that alone, sir."
+                    pending_n8n_action = None
 
                 elif any(w in t_lower for w in ["quit work mode", "exit work mode", "go back to chat", "regular mode", "stop working"]):
                     if work_session.active:
@@ -2667,7 +3117,10 @@ async def voice_handler(ws: WebSocket):
                             asyncio.create_task(_lookup_and_report("calendar", _do_calendar_lookup, ws, history=history, voice_state=voice_state))
                         elif action["action"] == "check_mail":
                             response_text = "Checking your inbox now, sir."
-                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state))
+                            # get_unread_count/get_unread_messages can take ~65-75s on a large
+                            # inbox (see mail_access.py) — the default 30s outer timeout would
+                            # fire before the real answer ever comes back.
+                            asyncio.create_task(_lookup_and_report("mail", _do_mail_lookup, ws, history=history, voice_state=voice_state, timeout=90))
                         elif action["action"] == "check_dispatch":
                             recent = dispatch_registry.get_most_recent()
                             if not recent:
@@ -2711,6 +3164,34 @@ async def voice_handler(ws: WebSocket):
                                 VOICE_ENGINE = "say"
                                 SAY_VOICE = say_voice
                                 response_text = f"Voice switched to {say_voice}, sir."
+                            else:
+                                response_text = "Sorry, I didn't catch which voice, sir."
+                        elif action["action"] == "conversation_recall":
+                            response_text = _voice_conversation_recall(action.get("topic", ""), session_id)
+                        elif action["action"] == "music_play":
+                            result = await music_control.play(action.get("query", ""))
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "music_pause":
+                            result = await music_control.pause()
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "music_next":
+                            result = await music_control.next_track()
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "music_previous":
+                            result = await music_control.previous_track()
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "music_now_playing":
+                            result = await music_control.now_playing()
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "music_volume":
+                            result = await music_control.set_volume(action.get("level", 50))
+                            response_text = f"{result['message']}, sir."
+                        elif action["action"] == "shopping_add":
+                            response_text = _shopping_add(action.get("items", ""))
+                        elif action["action"] == "shopping_list":
+                            response_text = _shopping_list_voice()
+                        elif action["action"] == "shopping_check":
+                            response_text = _shopping_check(action.get("items", ""))
                         else:
                             response_text = "Understood, sir."
                     else:
@@ -2739,6 +3220,10 @@ async def voice_handler(ws: WebSocket):
                                         response_text = "On it, sir."
                                     elif action_type == "research":
                                         response_text = "Looking into that now, sir."
+                                    elif action_type == "organize":
+                                        response_text = "Taking a look at the clutter now, sir."
+                                    elif action_type == "organize_confirm":
+                                        response_text = "Sorting that out now, sir."
                                     else:
                                         response_text = "Right away, sir."
 
@@ -2795,6 +3280,18 @@ async def voice_handler(ws: WebSocket):
                                             log.info(f"Using recent dispatch result for {proj_name} instead of re-dispatching")
                                             response_text = recent["summary"]
                                             history.append({"role": "assistant", "content": f"[Previous dispatch result for {proj_name}]: {recent['summary']}"})
+                                        elif (
+                                            proj_name.lower() in _SELF_PROJECT_NAMES
+                                            or _find_project_dir(proj_name) == str(Path(PROJECT_DIR).resolve())
+                                        ):
+                                            # Gate on the RESOLVED directory, not just the name the LLM chose —
+                                            # a differently-worded target ("jarvis-project" vs "jarvis") must
+                                            # still be caught if it resolves to JARVIS's own live repo.
+                                            # Never dispatch a skip-permissions session against that unattended —
+                                            # hold it for explicit confirmation instead.
+                                            pending_self_dispatch = {"prompt": prompt, "ts": time.time()}
+                                            response_text = f"That means changing my own code, sir — {prompt[:140]} — shall I go ahead?"
+                                            log.info(f"Self-dispatch held for confirmation: {prompt[:80]}")
                                         else:
                                             asyncio.create_task(
                                                 _execute_prompt_project(proj_name, prompt, work_session, ws, history=history, voice_state=voice_state)
@@ -2862,10 +3359,44 @@ async def voice_handler(ws: WebSocket):
                                     asyncio.create_task(_read_and_report(embedded_action["target"].strip(), ws))
                                 elif embedded_action["action"] == "draft_reply":
                                     asyncio.create_task(_draft_reply_and_report(embedded_action["target"].strip(), ws, history, voice_state))
+                                elif embedded_action["action"] == "send_email":
+                                    asyncio.create_task(_send_email_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "create_event":
+                                    asyncio.create_task(_create_event_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "send_message":
+                                    asyncio.create_task(_send_message_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "music":
+                                    asyncio.create_task(_music_action_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "recall":
+                                    asyncio.create_task(_recall_and_report(embedded_action["target"], ws, session_id))
+                                elif embedded_action["action"] == "organize":
+                                    asyncio.create_task(_organize_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "organize_confirm":
+                                    asyncio.create_task(_organize_confirm_and_report(ws))
+                                elif embedded_action["action"] == "shopping":
+                                    asyncio.create_task(_shopping_action_and_report(embedded_action["target"], ws))
+                                elif embedded_action["action"] == "n8n":
+                                    wf_id, wf_payload = _parse_n8n_target(embedded_action["target"])
+                                    wf = get_n8n_workflow(wf_id)
+                                    if wf is None:
+                                        response_text = f"I don't have a workflow called '{wf_id}' registered, sir."
+                                    elif wf["permission"] == "CONFIRM":
+                                        pending_n8n_action = {"workflow_id": wf_id, "payload": wf_payload, "ts": time.time()}
+                                        response_text = f"That'll run the {wf_id} workflow, sir — shall I go ahead?"
+                                        log.info(f"n8n CONFIRM held: {wf_id}")
+                                    else:
+                                        asyncio.create_task(_n8n_action_and_report(wf_id, wf_payload, ws))
 
                 # Update history
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": response_text})
+
+                # Persist to durable cross-session conversation memory (best-effort)
+                try:
+                    conversation_memory.log_turn(session_id, "user", user_text)
+                    conversation_memory.log_turn(session_id, "assistant", response_text)
+                except Exception as e:
+                    log.warning(f"conversation_memory log_turn failed: {e}")
 
                 # Three-tier memory: also track in session buffer
                 session_buffer.append({"role": "user", "content": user_text})
@@ -2924,7 +3455,12 @@ async def voice_handler(ws: WebSocket):
                         await ws.send_json({"type": "audio", "data": "", "text": fallback})
                     # Let client's audioPlayer.onFinished handle idle transition
                 except Exception:
-                    pass
+                    # The fallback send failed too — the socket itself is dead
+                    # (e.g. already closed). Stop the loop rather than looping
+                    # back to receive/send on a dead connection, which would
+                    # just repeat this same failure for every buffered message.
+                    log.info("WebSocket appears closed — ending session")
+                    break
 
     except WebSocketDisconnect:
         log.info("Voice WebSocket disconnected")
@@ -3313,6 +3849,14 @@ if __name__ == "__main__":
         ssl_kwargs["ssl_keyfile"] = str(key_file)
         ssl_kwargs["ssl_certfile"] = str(cert_file)
 
+    # NOTE on --reload: it watches the whole repo root, so the app's own
+    # runtime writes (data/*.db-wal, usage_log.jsonl) trigger periodic
+    # "N changes detected" log lines. Verified this is cosmetic only —
+    # uvicorn's default reload_includes is *.py, so non-.py writes never
+    # trigger an actual restart. Tried scoping it with reload_dirs/
+    # reload_excludes to quiet the noise; that combination crashes inside
+    # uvicorn's resolve_reload_patterns() (a real bug, reproduced directly),
+    # so left unscoped — a crash risk isn't worth trading for less log noise.
     uvicorn.run(
         "server:app",
         host=args.host,

@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    # macOS runner, not Linux — Jarvis's test suite exercises real AppleScript
+    # calls (tests/test_applescript_escape.py) and Playwright's Chromium
+    # download assumes a Mac-compatible build. Costs more CI-minutes than
+    # Linux would, but a Linux runner would just fail on the AppleScript tests.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio
+
+      - name: Run tests
+        run: pytest tests/ -v

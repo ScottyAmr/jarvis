@@ -22,5 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pytest pytest-asyncio
 
+      - name: Install Playwright browser
+        run: playwright install chromium
+
       - name: Run tests
         run: pytest tests/ -v

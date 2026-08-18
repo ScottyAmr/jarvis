@@ -20,8 +20,8 @@ When a user clones this repo and starts Claude Code, help them:
 - **Backend**: FastAPI + Python (server.py, ~3300 lines)
 - **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb)
 - **Communication**: WebSocket (JSON messages + binary audio)
-- **AI**: pluggable backend (Anthropic Claude / Gemini / OpenAI-compatible) with automatic
-  rate-limit fallback across models — see `llm_provider.py`
+- **AI**: pluggable backend (Anthropic Claude / Gemini / OpenAI-compatible / OmniRoute) with
+  automatic rate-limit fallback across models — see `llm_provider.py`
 - **TTS**: Fish Audio (default), macOS `say`, or local Piper — see `VOICE_ENGINE`
 - **System**: AppleScript for Calendar, Mail, Notes, Music, Messages, Terminal integration
 

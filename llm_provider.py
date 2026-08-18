@@ -282,9 +282,10 @@ OPENAI_COMPAT_BASES = {
     "openai":     "https://api.openai.com/v1",
     "ollama":     "http://localhost:11434/v1",
     "lmstudio":   "http://localhost:1234/v1",
+    "omniroute":  "http://localhost:20128/v1",
 }
 # Providers that run on your own machine and need no API key.
-LOCAL_PROVIDERS = {"ollama", "lmstudio"}
+LOCAL_PROVIDERS = {"ollama", "lmstudio", "omniroute"}
 
 # Free tiers rate-limit aggressively (429). Rather than fail the whole turn, wait
 # the server-suggested time and retry — but cap the wait so a voice reply never
@@ -452,6 +453,10 @@ class _CompatMessages:
                         last_detail = f"HTTP {resp.status_code} on '{mdl}': {resp.text[:160]}"
 
                     transient = kind in ("rate_limit_minute", "server", "timeout", "network")
+                    # OmniRoute is a local gateway — 401/400 mean the combo exhausted
+                    # all upstream providers, not a real auth failure. Retry those.
+                    if c.provider in LOCAL_PROVIDERS and kind in ("auth", "unknown"):
+                        transient = True
                     if not transient or attempt >= RATE_LIMIT_MAX_RETRIES:
                         break
                     wait = min(_retry_after_seconds(resp) + 0.25, RATE_LIMIT_MAX_WAIT) if resp is not None else 1.0
@@ -467,7 +472,8 @@ class _CompatMessages:
                     break
 
                 # this model failed — auth won't be fixed by another model
-                if kind == "auth":
+                # (but local gateways like OmniRoute don't have real auth errors)
+                if kind == "auth" and c.provider not in LOCAL_PROVIDERS:
                     raise LLMError("auth", f"{c.provider} authentication failed: {last_detail}")
                 if mi < len(models_to_try) - 1:
                     log.warning(f"{c.provider}: '{mdl}' failed ({kind}) — falling back to '{models_to_try[mi + 1]}'")

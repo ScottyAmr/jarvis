@@ -10,6 +10,10 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 
 > "Will do, sir."
 
+![JARVIS Orb](docs/demo-orb.png)
+
+![JARVIS Dashboard](docs/demo-dashboard.png)
+
 ---
 
 ## What It Does

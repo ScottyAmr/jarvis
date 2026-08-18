@@ -40,8 +40,16 @@ frontend/.vite/
 .claude/
 .arch/
 
+# Internal project memory (developer session logs)
+JARVIS_MEMORY.md
+
 # Desktop overlay
 desktop-overlay/node_modules/
+desktop-overlay/JarvisOverlay
 context/
+
+# Compiled Swift helpers
+helpers/calendar_helper
+
 *.db-shm
 *.db-wal

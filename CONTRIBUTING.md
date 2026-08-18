@@ -22,7 +22,7 @@ Thanks for your interest in contributing! Here's how to get involved.
 
 ## Code Style
 
-Yes, `server.py` is a 2400-line monolith. It works. If you want to refactor parts into modules, that's welcome — just make sure nothing breaks.
+Yes, `server.py` is a ~3900-line monolith. It works. If you want to refactor parts into modules, that's welcome — just make sure nothing breaks.
 
 - Keep voice responses short (1-2 sentences max)
 - Don't add dependencies unless necessary
@@ -33,7 +33,7 @@ Yes, `server.py` is a 2400-line monolith. It works. If you want to refactor part
 
 - Don't add telemetry or analytics
 - Don't send data to external services beyond the existing API calls (Anthropic, Fish Audio)
-- Don't add features that modify or delete user data in connected services (Mail, Calendar, Notes)
+- Don't add features that **delete** user data in connected services (Mail, Calendar, Notes). JARVIS can create/send — see the action system docs.
 - Don't break the existing voice loop
 
 ## Reporting Issues
